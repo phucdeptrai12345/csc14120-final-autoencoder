@@ -1,6 +1,11 @@
-# Datasets & models (KHÔNG commit)
-data/
-models/
+# Datasets & models: ignore hết, chỉ giữ .gitkeep để hiện folder trên GitHub
+data/*
+!data/.gitkeep
+
+models/*
+!models/.gitkeep
+
+# Large binary/data files
 *.tar.gz
 *.bin
 *.npz
@@ -14,6 +19,6 @@ models/
 .vscode/
 .idea/
 
-# Python / Notebook junk (nếu sau này thêm)
+# Python / Notebook junk
 __pycache__/
 .ipynb_checkpoints/
