@@ -1,0 +1,8 @@
+# Ignore dataset & large files
+cifar-10-binary.tar.gz
+data/
+models/
+
+# Colab / temp
+.ipynb_checkpoints/
+*.log
