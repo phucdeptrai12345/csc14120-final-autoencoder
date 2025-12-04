@@ -1,9 +1,19 @@
-# Ignore dataset & large files
-cifar-10-binary.tar.gz
+# Datasets & models (KHÔNG commit)
 data/
 models/
+*.tar.gz
+*.bin
+*.npz
 
-# Colab / temp
-.ipynb_checkpoints/
+# Build & executable
+*.exe
+*.out
 *.log
-test_cifar
+
+# IDE / editor
+.vscode/
+.idea/
+
+# Python / Notebook junk (nếu sau này thêm)
+__pycache__/
+.ipynb_checkpoints/
