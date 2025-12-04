@@ -6,3 +6,4 @@ models/
 # Colab / temp
 .ipynb_checkpoints/
 *.log
+test_cifar
