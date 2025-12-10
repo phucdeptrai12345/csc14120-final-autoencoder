@@ -12,7 +12,7 @@ Autoencoder::Autoencoder()
 
     enc_conv2 = new Conv2D(256, 128, 3, 1, 1);
     enc_relu2 = new ReLU();
-    enc_pool2 = new MaxPool2D(2, 2); // -> 8x8x128 (Latent)
+    enc_pool2 = new MaxPool2D(2, 2); // -> 8x8x128 
 
     // DECODER ARCHITECTURE [cite: 192-207]
     dec_conv1 = new Conv2D(128, 128, 3, 1, 1);
@@ -23,9 +23,6 @@ Autoencoder::Autoencoder()
     dec_relu2 = new ReLU();
     dec_up2 = new UpSample2D(2); // -> 32x32x256
 
-    // Lớp cuối cùng: 3 filters để ra ảnh RGB, không activation (linear) hoặc Sigmoid
-    // Đề bài không yêu cầu Sigmoid rõ ràng, nhưng input [0,1] nên output cũng nên thế.
-    // Ở đây ta dùng Conv linear, MSE sẽ tự ép nó về đúng khoảng.
     dec_conv3 = new Conv2D(256, 3, 3, 1, 1);
 }
 
@@ -48,10 +45,6 @@ Autoencoder::~Autoencoder()
 
 void Autoencoder::forward(const Tensor &input, Tensor &output)
 {
-    // Các biến trung gian (cần thiết nếu muốn quản lý bộ nhớ tốt hơn,
-    // ở đây khai báo cục bộ, vector sẽ tự giải phóng, nhưng tốn chi phí cấp phát lại)
-    // Để tối ưu phase 1, ta cứ để nó tự động.
-
     Tensor t1, t2, t3, t4, t5, t6, t7, t8, t9, t10;
 
     // Encoder
@@ -77,9 +70,9 @@ void Autoencoder::forward(const Tensor &input, Tensor &output)
 
 void Autoencoder::backward(const Tensor &input, const Tensor &output, float lr)
 {
-    // 1. Tính đạo hàm của Loss (MSE) w.r.t Output
+    // Gradient LOSS (MSE) w.r.t Output
     // Loss = (output - input)^2
-    // dLoss/dOutput = 2 * (output - input) / N (bỏ qua 1/N hằng số cũng được hoặc gộp vào lr)
+    // dLoss/dOutput = 2 * (output - input)
     Tensor d_out(output.c, output.h, output.w);
     for (size_t i = 0; i < d_out.data.size(); ++i)
     {
@@ -87,8 +80,6 @@ void Autoencoder::backward(const Tensor &input, const Tensor &output, float lr)
     }
 
     Tensor d1, d2, d3, d4, d5, d6, d7, d8, d9;
-
-    // Backprop ngược lại với quy trình forward
 
     // Decoder Backward
     dec_conv3->backward(d_out, d1, lr);
@@ -125,7 +116,7 @@ float Autoencoder::compute_loss(const Tensor &original, const Tensor &reconstruc
 void Autoencoder::save_weights(const std::string &filepath)
 {
     std::ofstream file(filepath, std::ios::binary);
-    // Hàm phụ để ghi vector
+
     auto write_vec = [&](const std::vector<float> &v)
     {
         size_t size = v.size();
@@ -157,12 +148,10 @@ void Autoencoder::load_weights(const std::string &filepath)
         return;
     }
 
-    // Hàm phụ để đọc vector (Ngược lại với write_vec)
     auto read_vec = [&](std::vector<float> &v)
     {
         size_t size;
         file.read((char *)&size, sizeof(size));
-        // Resize vector để chứa đủ dữ liệu
         v.resize(size);
         file.read((char *)v.data(), size * sizeof(float));
     };
@@ -185,19 +174,15 @@ void Autoencoder::load_weights(const std::string &filepath)
 
 void Autoencoder::extract_features(const Tensor &input, std::vector<float> &features)
 {
-    // Biến trung gian cục bộ để chạy Encoder
     Tensor t1, t2, t3, t4, t5, latent;
 
-    // Chỉ chạy luồng Encoder (Forward pass nửa đầu)
     enc_conv1->forward(input, t1);
     enc_relu1->forward(t1, t2);
     enc_pool1->forward(t2, t3);
 
     enc_conv2->forward(t3, t4);
     enc_relu2->forward(t4, t5);
-    enc_pool2->forward(t5, latent); // Kết quả là Tensor (128, 8, 8)
+    enc_pool2->forward(t5, latent);
 
-    // Flatten (Duỗi phẳng) Tensor thành Vector cho SVM
-    // Latent size = 128 * 8 * 8 = 8192
     features = latent.data;
 }

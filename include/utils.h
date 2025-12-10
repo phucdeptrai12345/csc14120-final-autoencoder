@@ -7,7 +7,6 @@
 #include <cmath>
 #include <cassert>
 
-// Cấu trúc Tensor 3 chiều: [Channels, Height, Width]
 struct Tensor
 {
     int c, h, w;

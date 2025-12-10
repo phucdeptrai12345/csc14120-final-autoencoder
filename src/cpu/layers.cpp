@@ -8,8 +8,7 @@ Conv2D::Conv2D(int in_c, int out_c, int k_size, int s, int p)
     : in_channels(in_c), out_channels(out_c), kernel_size(k_size), stride(s), padding(p)
 {
 
-    // Khởi tạo trọng số và bias
-    // Weights shape giả lập: [out_c * in_c * k * k]
+    // Init weights and biases
     weights.resize(out_channels * in_channels * kernel_size * kernel_size);
     biases.resize(out_channels, 0.0f);
 
@@ -21,9 +20,9 @@ Conv2D::Conv2D(int in_c, int out_c, int k_size, int s, int p)
 
 void Conv2D::forward(const Tensor &input, Tensor &output)
 {
-    input_cache = input; // Lưu input để dùng cho backward
+    this->input_cache = input; // Lưu input để dùng cho backward
 
-    // Tính kích thước output
+    // output size
     // H_out = (H_in + 2*pad - kernel) / stride + 1
     int out_h = (input.h + 2 * padding - kernel_size) / stride + 1;
     int out_w = (input.w + 2 * padding - kernel_size) / stride + 1;
@@ -35,17 +34,17 @@ void Conv2D::forward(const Tensor &input, Tensor &output)
     }
     else
     {
-        output.zero_grad(); // Xóa dữ liệu cũ nếu dùng lại tensor
+        output.zero_grad(); 
     }
 
-    // Naive Convolution: 6 nested loops [cite: 289]
+    // Naive Convolution: 6 nested loops
     for (int oc = 0; oc < out_channels; ++oc)
     {
         for (int oh = 0; oh < out_h; ++oh)
         {
             for (int ow = 0; ow < out_w; ++ow)
             {
-
+                // Calculate Value
                 float sum = biases[oc];
 
                 for (int ic = 0; ic < in_channels; ++ic)
@@ -60,7 +59,7 @@ void Conv2D::forward(const Tensor &input, Tensor &output)
 
                             if (in_row >= 0 && in_row < input.h && in_col >= 0 && in_col < input.w)
                             {
-                                // Index trọng số phẳng
+                                // Index weights
                                 int w_idx = oc * (in_channels * kernel_size * kernel_size) +
                                             ic * (kernel_size * kernel_size) +
                                             kh * kernel_size + kw;
@@ -68,6 +67,7 @@ void Conv2D::forward(const Tensor &input, Tensor &output)
                             }
                         }
                     }
+                    
                 }
                 output(oc, oh, ow) = sum;
             }
@@ -80,8 +80,6 @@ void Conv2D::backward(const Tensor &dout, Tensor &din, float lr)
     // Reset gradient input
     din = Tensor(in_channels, input_cache.h, input_cache.w);
 
-    // Xóa gradient tích lũy của batch trước (nếu không dùng batch accumulation bên ngoài)
-    // Ở đây ta giả sử update ngay hoặc tích lũy thủ công. Để đơn giản, ta tính gradient cho 1 ảnh.
     std::fill(grad_weights.begin(), grad_weights.end(), 0.0f);
     std::fill(grad_biases.begin(), grad_biases.end(), 0.0f);
 
@@ -124,8 +122,7 @@ void Conv2D::backward(const Tensor &dout, Tensor &din, float lr)
         }
     }
 
-    // Update weights (SGD) [cite: 265]
-    // Lưu ý: Trong thực tế thường update sau 1 batch, ở đây demo update từng ảnh hoặc gọi hàm update riêng
+    // update weights an biases
     for (size_t i = 0; i < weights.size(); ++i)
     {
         weights[i] -= lr * grad_weights[i];
@@ -193,13 +190,12 @@ void MaxPool2D::forward(const Tensor &input, Tensor &output)
                         if (val > max_val)
                         {
                             max_val = val;
-                            // Lưu index phẳng: row * width + col
                             max_idx = in_row * input.w + in_col;
                         }
                     }
                 }
                 output(c, h, w) = max_val;
-                index_mask(c, h, w) = (float)max_idx; // Lưu lại vị trí để backprop
+                index_mask(c, h, w) = (float)max_idx; 
             }
         }
     }
@@ -215,13 +211,8 @@ void MaxPool2D::backward(const Tensor &dout, Tensor &din)
         {
             for (int w = 0; w < dout.w; ++w)
             {
-                // Lấy lại vị trí max từ forward pass
                 int max_idx = (int)index_mask(c, h, w);
 
-                // Chỉ truyền gradient về đúng vị trí max đó
-                // Chuyển index phẳng về tọa độ (thực ra index phẳng truy cập data[] là đủ)
-                // din(c, max_row, max_col) += dout(c, h, w);
-                // Truy cập trực tiếp mảng data để nhanh hơn:
                 int offset = c * din.h * din.w + max_idx;
                 din.data[offset] += dout(c, h, w);
             }
@@ -239,14 +230,13 @@ void UpSample2D::forward(const Tensor &input, Tensor &output)
     int out_w = input.w * scale_factor;
     output = Tensor(input.c, out_h, out_w);
 
-    // Nearest Neighbor [cite: 305]
+    // Nearest Neighbor
     for (int c = 0; c < output.c; ++c)
     {
         for (int h = 0; h < out_h; ++h)
         {
             for (int w = 0; w < out_w; ++w)
             {
-                // Map về tọa độ input
                 int in_h = h / scale_factor;
                 int in_w = w / scale_factor;
                 output(c, h, w) = input(c, in_h, in_w);
@@ -257,12 +247,10 @@ void UpSample2D::forward(const Tensor &input, Tensor &output)
 
 void UpSample2D::backward(const Tensor &dout, Tensor &din)
 {
-    // Input của forward là output của backward (về mặt kích thước)
     int in_h = dout.h / scale_factor;
     int in_w = dout.w / scale_factor;
-    din = Tensor(dout.c, in_h, in_w); // Init 0
+    din = Tensor(dout.c, in_h, in_w);
 
-    // Backward của Nearest Neighbor là tổng gradient của các pixel được copy
     for (int c = 0; c < dout.c; ++c)
     {
         for (int h = 0; h < dout.h; ++h)
