@@ -1,9 +1,9 @@
 #include "../../include/dataset.h"
 #include <fstream>
 #include <iostream>
-#include <memory>    // Cho std::unique_ptr
-#include <algorithm> // Cho std::shuffle
-#include <random>    // Cho std::mt19937
+#include <memory>    
+#include <algorithm> 
+#include <random> 
 
 void CIFAR10Dataset::load_train(const std::string &data_folder)
 {
@@ -37,7 +37,6 @@ void CIFAR10Dataset::load_test(const std::string &data_folder)
     std::cout << "Loaded " << test_images.size() << " test images." << std::endl;
 }
 
-// Hàm đọc file nhị phân và chuẩn hóa dữ liệu
 void CIFAR10Dataset::read_binary_file(const std::string &filename, std::vector<Tensor> &images, std::vector<unsigned char> &labels)
 {
     std::ifstream file(filename, std::ios::in | std::ios::binary | std::ios::ate);
@@ -64,28 +63,19 @@ void CIFAR10Dataset::read_binary_file(const std::string &filename, std::vector<T
 
     for (int i = 0; i < num_images; ++i)
     {
-        // Tính vị trí bắt đầu của ảnh trong buffer
+        // Start image byte
         int start_idx = i * entry_size;
 
-        // Byte đầu tiên là Label
+        // Byte label
         unsigned char label = (unsigned char)buffer[start_idx];
         labels.push_back(label);
 
-        // Tạo Tensor rỗng kích thước 3x32x32
         Tensor img(3, 32, 32);
 
-        // Con trỏ tới vùng dữ liệu ảnh trong buffer raw
-        // +1 để bỏ qua byte label
+        // First Byte 
         char *img_buffer_ptr = &buffer[start_idx + 1];
 
-        /* CIFAR-10 lưu trữ theo định dạng Channel-First (CHW):
-           1024 bytes Red -> 1024 bytes Green -> 1024 bytes Blue.
-           Điều này khớp hoàn toàn với cách lưu trữ của Tensor thông thường (phẳng hóa vector).
-
-           Thay vì dùng 3 vòng lặp lồng nhau, ta có thể copy phẳng để tăng tốc độ (Cache friendly).
-        */
-
-        // Đảm bảo Tensor của bạn có vector 'data' public và đã được resize(3*32*32) trong constructor
+        // Check size
         if (img.data.size() != 3072)
         {
             img.data.resize(3072);
@@ -93,10 +83,8 @@ void CIFAR10Dataset::read_binary_file(const std::string &filename, std::vector<T
 
         for (int k = 0; k < 3072; ++k)
         {
-            // [QUAN TRỌNG] Ép kiểu sang unsigned char để lấy giá trị 0-255
             unsigned char pixel_byte = (unsigned char)img_buffer_ptr[k];
 
-            // [FIX NAN] Chuẩn hóa ngay tại đây: chia cho 255.0f
             img.data[k] = static_cast<float>(pixel_byte) / 255.0f;
         }
 

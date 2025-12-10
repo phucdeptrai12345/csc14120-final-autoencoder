@@ -8,19 +8,15 @@
 #include "../../include/dataset.h"
 #include "../../include/autoencoder.h"
 
-// --- 1. CẤU HÌNH ĐỂ TEST NHANH ---
 const int BATCH_SIZE = 32;
-// Giảm số epoch xuống 5 để test nhanh (thay vì 20)
+
 const int EPOCHS = 5;
 const float LEARNING_RATE = 0.00001f;
 
-// [QUAN TRỌNG] Giới hạn số lượng ảnh để train (thay vì 50000)
-// 100 ảnh là đủ để kiểm tra code chạy đúng hay sai trong 1-2 phút
 const int DEBUG_LIMIT = 100;
 
 int main()
 {
-    // Tạo thư mục models nếu chưa có
     if (!std::filesystem::exists("models"))
     {
         std::filesystem::create_directory("models");
@@ -40,18 +36,14 @@ int main()
         return 1;
     }
 
-    // [CẮT DỮ LIỆU ĐỂ CHẠY NHANH]
     if (dataset.train_images.size() > DEBUG_LIMIT)
     {
         std::cout << "WARNING: Resizing dataset to " << DEBUG_LIMIT
                   << " images for fast testing on CPU." << std::endl;
 
-        // Cắt bớt vector dữ liệu
         dataset.train_images.resize(DEBUG_LIMIT);
         dataset.train_labels.resize(DEBUG_LIMIT);
 
-        // Cập nhật lại vector chỉ số (indices) cho bộ shuffle
-        // Bắt buộc phải clear để shuffle_data() tự tạo lại đúng kích thước mới
         dataset.indices.clear();
     }
 
@@ -74,7 +66,6 @@ int main()
     {
         auto start_time = std::chrono::high_resolution_clock::now();
 
-        // Xáo trộn dữ liệu (trên tập đã cắt nhỏ)
         dataset.shuffle_data();
 
         float total_epoch_loss = 0.0f;
@@ -82,7 +73,6 @@ int main()
 
         std::vector<Tensor> batch_images;
 
-        // Vòng lặp Batch
         while (dataset.get_next_batch(BATCH_SIZE, batch_images))
         {
             float batch_loss = 0.0f;
@@ -104,7 +94,6 @@ int main()
             total_epoch_loss += batch_loss;
             total_images += batch_images.size();
 
-            // In dấu chấm để biết chương trình đang chạy (không bị treo)
             std::cout << "." << std::flush;
         }
         std::cout << "\r"; // Xóa dòng dấu chấm
@@ -124,7 +113,7 @@ int main()
 
     // --- 5. SAVE MODEL ---
     std::cout << "[4/4] Saving trained weights..." << std::endl;
-    std::string model_path = "models/cifar10_ae_cpu_debug.bin";
+    std::string model_path = "models/best_model.bin";
     model.save_weights(model_path);
 
     std::cout << "      Model saved to: " << model_path << std::endl;

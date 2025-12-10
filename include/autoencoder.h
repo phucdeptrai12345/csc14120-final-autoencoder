@@ -31,24 +31,17 @@ public:
 
     // Conv5: 256 -> 3 (Output)
     Conv2D *dec_conv3;
-    // Lưu ý: Lớp cuối thường không có ReLU để tái tạo pixel chuẩn xác hơn
 
     Autoencoder();
-    ~Autoencoder(); // Destructor để giải phóng bộ nhớ
+    ~Autoencoder();
 
-    // Lan truyền thuận toàn mạng
     void forward(const Tensor &input, Tensor &output);
 
-    // Lan truyền ngược toàn mạng
-    // input: ảnh gốc (dùng để tính loss)
-    // output: ảnh đã tái tạo
-    // lr: learning rate
     void backward(const Tensor &input, const Tensor &output, float lr);
 
-    // Tính MSE Loss
+    // MSE Loss
     float compute_loss(const Tensor &original, const Tensor &reconstructed);
 
-    // Lưu và tải trọng số (cho Giai đoạn 3 và 4)
     void save_weights(const std::string &filepath);
     void load_weights(const std::string &filepath);
 
