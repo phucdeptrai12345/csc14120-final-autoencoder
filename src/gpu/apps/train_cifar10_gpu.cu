@@ -69,21 +69,22 @@ int main() {
         // Train trên tất cả batches
         for (int b = 0; b < num_batches; ++b) {
             int start_idx = b * batch_size;
+            int current_batch_size = std::min(batch_size, num_train - start_idx);
             
             // Get batch
             std::vector<float> batch_images;
             std::vector<int> batch_labels;  // Không dùng cho autoencoder nhưng cần cho get_batch
             loader.get_batch(train_images, train_labels,
                            batch_images, batch_labels,
-                           batch_size, start_idx);
+                           current_batch_size, start_idx);
 
-            // Copy batch to GPU
+            // Copy batch to GPU (only current_batch_size * IMAGE_SIZE elements)
             CUDA_CHECK(cudaMemcpy(d_batch_input, batch_images.data(),
                                  batch_images.size() * sizeof(float),
                                  cudaMemcpyHostToDevice));
 
-            // Train step
-            float loss = ae.train_step(d_batch_input, d_batch_recon);
+            // Train step: PASS actual batch size
+            float loss = ae.train_step(d_batch_input, d_batch_recon, current_batch_size);
             epoch_loss += loss;
             batches_processed++;
         }
@@ -121,4 +122,3 @@ int main() {
 
     return 0;
 }
-

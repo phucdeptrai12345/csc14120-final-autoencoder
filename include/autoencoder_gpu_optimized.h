@@ -34,13 +34,17 @@ public:
     AutoencoderGPUOptimized& operator=(const AutoencoderGPUOptimized&) = delete;
 
     // Forward: uses FUSED Conv+ReLU kernels (Step 1 optimization)
-    void forward(const float* d_input, float* d_recon, cudaStream_t stream = 0);
+    // actual_N optional: number of valid samples in the supplied buffer (default: use N_).
+    void forward(const float* d_input, float* d_recon, int actual_N = -1, cudaStream_t stream = 0);
 
     // Feature extraction: encoder only
-    void extract_features(const float* d_input, float* d_features, cudaStream_t stream = 0);
+    // actual_N optional: number of valid samples in the supplied buffer
+    void extract_features(const float* d_input, float* d_features, int actual_N = -1, cudaStream_t stream = 0);
 
     // Training step: forward + backward + update
+    // actual_N optional: number of valid samples
     float train_step(const float* d_input, float* d_recon,
+                     int actual_N = -1,
                      cudaStream_t stream = 0,
                      bool compute_loss_host = false,
                      float* h_loss_out = nullptr);
@@ -48,6 +52,7 @@ public:
     // Async loss version: returns immediately, loss computed on stream_loss
     // If async params are nullptr, falls back to sync mode
     void train_step_async_loss(const float* d_input, float* d_recon,
+                               int actual_N,
                                cudaStream_t stream_compute,
                                float* d_loss_buf,      // Pre-allocated device loss buffer
                                float* h_loss_buf,      // Host buffer for loss result
@@ -55,10 +60,12 @@ public:
                                cudaEvent_t ev_loss_done,     // Event to record after loss copy
                                cudaStream_t stream_loss);
 
-    // Backward pass (uses naive kernels for now)
+    // Backward pass (uses optimized/naive kernels)
+    // actual_N optional: number of valid samples
     void backward(const float* d_input,
                   const float* d_recon,
                   const float* d_drecon,
+                  int actual_N = -1,
                   cudaStream_t stream = 0);
 
     // SGD update
@@ -141,4 +148,3 @@ private:
 };
 
 #endif // AUTOENCODER_GPU_OPTIMIZED_H
-
