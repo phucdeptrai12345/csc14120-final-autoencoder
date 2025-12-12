@@ -110,6 +110,7 @@ private:
     float *d_dconv3_, *d_drelu3_, *d_dup1_;
     float *d_dconv4_, *d_drelu4_, *d_dup2_;
     float *d_dconv5_;
+    float *d_dinput1_; // gradient wrt original input of conv1 (separate buffer)
     // Reusable buffer for dL/d(recon)
     float *d_drecon_;
 };

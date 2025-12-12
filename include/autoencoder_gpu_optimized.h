@@ -44,6 +44,16 @@ public:
                      cudaStream_t stream = 0,
                      bool compute_loss_host = false,
                      float* h_loss_out = nullptr);
+    
+    // Async loss version: returns immediately, loss computed on stream_loss
+    // If async params are nullptr, falls back to sync mode
+    void train_step_async_loss(const float* d_input, float* d_recon,
+                               cudaStream_t stream_compute,
+                               float* d_loss_buf,      // Pre-allocated device loss buffer
+                               float* h_loss_buf,      // Host buffer for loss result
+                               cudaEvent_t ev_compute_done,  // Event to record after step()
+                               cudaEvent_t ev_loss_done,     // Event to record after loss copy
+                               cudaStream_t stream_loss);
 
     // Backward pass (uses naive kernels for now)
     void backward(const float* d_input,
@@ -116,15 +126,15 @@ private:
     // Temporary buffer for Conv1 backward input gradient (tránh race condition)
     float *d_dinput_temp_;
     
-    // Mixed Precision (FP16) buffers - reused across forward passes
+    // GEMM (im2col + cuBLAS) workspaces
+    float *d_im2col_;   // workspace for im2col
+    float *d_gemm_out_; // workspace for GEMM output (column-major)
+    __half *d_im2col_fp16_; // workspace FP16 im2col for GEMM FP16
+    cublasHandle_t cublas_handle_;
+    
+    // Mixed Precision (FP16) - chỉ dùng cho Conv2-4 với GEMM
     bool use_mixed_precision_;
     bool gpu_supports_fp16_;
-    // FP16 buffers for activations (reused to avoid allocation overhead)
-    // Need separate input/output buffers to avoid race conditions
-    __half *d_fp16_input1_, *d_fp16_output1_;  // For Conv1 (input: N*3*32*32, output: N*256*32*32)
-    __half *d_fp16_input2_, *d_fp16_output2_;  // For Conv2 (input: N*256*16*16, output: N*128*16*16)
-    __half *d_fp16_input3_, *d_fp16_output3_;  // For Conv3 (input: N*128*8*8, output: N*128*8*8)
-    __half *d_fp16_input4_, *d_fp16_output4_;  // For Conv4 (input: N*128*16*16, output: N*256*16*16)
     
     // Helper: Check GPU FP16 support
     bool check_fp16_support();

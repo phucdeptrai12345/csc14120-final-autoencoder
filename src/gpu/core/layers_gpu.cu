@@ -112,6 +112,7 @@ __global__ void conv2d_backward_input_kernel(
     float sum = 0.0f;
 
     // sum over tất cả output channel & kernel positions
+    // NOTE: Unroll removed - compiler auto-optimizes small loops, manual unroll can increase register pressure
     for (int co = 0; co < C_out; ++co) {
         for (int kh = 0; kh < K; ++kh) {
             for (int kw = 0; kw < K; ++kw) {
@@ -339,6 +340,7 @@ __global__ void maxpool2d_forward_kernel(
 
     float m = -1e30f;
 
+    // NOTE: Unroll removed - compiler auto-optimizes 2x2 loops, manual unroll can increase register pressure
     for (int dh = 0; dh < 2; ++dh) {
         for (int dw = 0; dw < 2; ++dw) {
             int ih = h_in + dh;
@@ -407,6 +409,7 @@ __global__ void maxpool2d_backward_kernel(
     };
 
     // Tìm argmax trong block 2x2 của input
+    // NOTE: Unroll removed - compiler auto-optimizes 2x2 loops, manual unroll can increase register pressure
     float max_val = -1e30f;
     int max_h = h_in;
     int max_w = w_in;
@@ -633,6 +636,32 @@ float mse_loss_forward_gpu(
 
     h_loss /= static_cast<float>(total_elements);
     return h_loss;
+}
+
+// Async version: uses pre-allocated buffers, returns immediately
+// Caller must sync stream_loss and divide by total_elements
+void mse_loss_forward_gpu_async(
+    const float* d_pred,
+    const float* d_target,
+    int total_elements,
+    float* d_loss_buf,  // Pre-allocated device buffer (must be zeroed)
+    float* h_loss_buf,  // Host buffer to receive result
+    cudaStream_t stream_loss)
+{
+    int block = 256;
+    int grid  = (total_elements + block - 1) / block;
+    if (grid > 1024) grid = 1024;
+
+    size_t shared_size = block * sizeof(float);
+
+    mse_loss_forward_kernel<<<grid, block, shared_size, stream_loss>>>(
+        d_pred, d_target, d_loss_buf, total_elements);
+
+    CUDA_CHECK(cudaGetLastError());
+
+    // Async copy to host
+    CUDA_CHECK(cudaMemcpyAsync(h_loss_buf, d_loss_buf, sizeof(float),
+                               cudaMemcpyDeviceToHost, stream_loss));
 }
 
 // ======================

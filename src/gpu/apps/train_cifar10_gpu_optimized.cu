@@ -66,24 +66,44 @@ int main() {
     CUDA_CHECK(cudaMalloc(&d_batch_input, batch_image_size * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_batch_recon, batch_image_size * sizeof(float)));
 
-    // ✅ OPTIMIZATION 4: MULTI-STREAM PIPELINE với EXPLICIT PREFETCHING
-    // 3 streams: 2 cho compute, 1 cho transfer (overlap tốt hơn)
-    cudaStream_t stream_compute[2];
+    // ✅ OPTIMIZATION 4: MULTI-STREAM PIPELINE (triple buffering + async loss)
+    // 3 streams compute + 1 transfer + 1 loss stream to overlap H2D, compute, và loss
+    cudaStream_t stream_compute[3];
     cudaStream_t stream_transfer;
+    cudaStream_t stream_loss;
     CUDA_CHECK(cudaStreamCreate(&stream_compute[0]));
     CUDA_CHECK(cudaStreamCreate(&stream_compute[1]));
+    CUDA_CHECK(cudaStreamCreate(&stream_compute[2]));
     CUDA_CHECK(cudaStreamCreate(&stream_transfer));
+    CUDA_CHECK(cudaStreamCreate(&stream_loss));
+    // Events để báo H2D xong cho từng buffer
+    cudaEvent_t ev_h2d_done[3];
+    for (int i = 0; i < 3; ++i) CUDA_CHECK(cudaEventCreateWithFlags(&ev_h2d_done[i], cudaEventDisableTiming));
+    // Events để sync loss computation
+    cudaEvent_t ev_compute_done[3];  // Recorded after step() completes
+    cudaEvent_t ev_loss_done[3];     // Recorded after loss copy completes
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_compute_done[i], cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&ev_loss_done[i], cudaEventDisableTiming));
+    }
     
-    // Allocate double buffers cho prefetching
-    float *d_batch_input_buf[2] = {nullptr, nullptr};
-    float *d_batch_recon_buf[2] = {nullptr, nullptr};
-    float *h_pinned_batch_buf[2] = {nullptr, nullptr};
-    CUDA_CHECK(cudaMalloc(&d_batch_input_buf[0], batch_image_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_batch_input_buf[1], batch_image_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_batch_recon_buf[0], batch_image_size * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_batch_recon_buf[1], batch_image_size * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(&h_pinned_batch_buf[0], batch_image_size * sizeof(float)));
-    CUDA_CHECK(cudaMallocHost(&h_pinned_batch_buf[1], batch_image_size * sizeof(float)));
+    // Loss buffers (device + host pinned)
+    float *d_loss_buf[3] = {nullptr, nullptr, nullptr};
+    float *h_loss_buf[3] = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaMalloc(&d_loss_buf[i], sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&h_loss_buf[i], sizeof(float)));
+    }
+    
+    // Triple buffers
+    float *d_batch_input_buf[3] = {nullptr, nullptr, nullptr};
+    float *d_batch_recon_buf[3] = {nullptr, nullptr, nullptr};
+    float *h_pinned_batch_buf[3] = {nullptr, nullptr, nullptr};
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaMalloc(&d_batch_input_buf[i], batch_image_size * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_batch_recon_buf[i], batch_image_size * sizeof(float)));
+        CUDA_CHECK(cudaMallocHost(&h_pinned_batch_buf[i], batch_image_size * sizeof(float)));
+    }
     
     std::cout << " ✓ Done\n" << std::flush;
 
@@ -100,6 +120,20 @@ int main() {
     float test_loss = ae.train_step(d_batch_input, d_batch_recon);
     std::cout << " ✓ Done (test loss: " << test_loss << ")\n" << std::flush;
 
+    // 5b. Warmup vài batch trước khi đo thời gian (ổn định xung GPU)
+    int warmup_batches = std::min(2, num_batches);
+    for (int w = 0; w < warmup_batches; ++w) {
+        int start_idx = w * batch_size;
+        int copy_size = std::min(batch_size, num_train - start_idx) * CIFAR10Loader::IMAGE_SIZE;
+        std::memcpy(h_pinned_batch,
+                   &train_images[start_idx * CIFAR10Loader::IMAGE_SIZE],
+                   copy_size * sizeof(float));
+        CUDA_CHECK(cudaMemcpy(d_batch_input, h_pinned_batch,
+                             copy_size * sizeof(float),
+                             cudaMemcpyHostToDevice));
+        ae.train_step(d_batch_input, d_batch_recon);
+    }
+
     // 6. Training loop
     std::cout << "Starting training...\n" << std::flush;
     auto start_total = std::chrono::high_resolution_clock::now();
@@ -109,8 +143,8 @@ int main() {
         loader.shuffle_data(train_images, train_labels);
 
         auto start_epoch = std::chrono::high_resolution_clock::now();
-        float epoch_loss_sum = 0.0f;
-        int loss_samples = 0;
+        // Track which batches computed loss and their buffer indices
+        std::vector<std::pair<int, int>> loss_batches;  // (batch_idx, buf_idx)
 
         // Prefetch first batch
         if (num_batches > 0) {
@@ -121,27 +155,31 @@ int main() {
             CUDA_CHECK(cudaMemcpyAsync(d_batch_input_buf[0], h_pinned_batch_buf[0],
                                        first_copy_size * sizeof(float),
                                        cudaMemcpyHostToDevice, stream_transfer));
+            CUDA_CHECK(cudaEventRecord(ev_h2d_done[0], stream_transfer));
         }
 
         for (int b = 0; b < num_batches; ++b) {
             int start_idx = b * batch_size;
             int current_batch_size = std::min(batch_size, num_train - start_idx);
-            int buf_idx = b % 2;
-            int next_buf_idx = (b + 1) % 2;
+            int buf_idx = b % 3;
+            int next_buf_idx = (b + 1) % 3;
             cudaStream_t current_compute_stream = stream_compute[buf_idx];
             
-            // OPTIMIZATION: Chỉ sync transfer stream khi batch đầu tiên hoặc khi cần thiết
-            // Batch đầu tiên: cần sync để đảm bảo data đã sẵn sàng
-            // Các batch tiếp theo: không cần sync vì đã prefetch từ batch trước
-            if (b == 0) {
-                CUDA_CHECK(cudaStreamSynchronize(stream_transfer));
-            }
+            // Đợi H2D của buffer hiện tại hoàn tất
+            CUDA_CHECK(cudaStreamWaitEvent(current_compute_stream, ev_h2d_done[buf_idx], 0));
             
             // Prefetch NEXT batch trong khi compute CURRENT batch
             if (b + 1 < num_batches) {
                 int next_start_idx = (b + 1) * batch_size;
                 int next_batch_size = std::min(batch_size, num_train - next_start_idx);
                 int next_copy_size = next_batch_size * CIFAR10Loader::IMAGE_SIZE;
+                
+                // OPTIMIZED: Chỉ đợi next buffer nếu đã wrap-around (b + 1 >= 3)
+                // Với triple buffering, sau 3 iterations mới có conflict
+                if (b + 1 >= 3) {
+                    // Next buffer đã được dùng trước đó, đợi compute hoàn thành trước khi overwrite
+                    CUDA_CHECK(cudaStreamWaitEvent(stream_transfer, ev_compute_done[next_buf_idx], 0));
+                }
                 
                 // CPU memcpy to pinned buffer (có thể overlap với GPU compute)
                 std::memcpy(h_pinned_batch_buf[next_buf_idx], 
@@ -153,28 +191,54 @@ int main() {
                                           h_pinned_batch_buf[next_buf_idx],
                                           next_copy_size * sizeof(float),
                                           cudaMemcpyHostToDevice, stream_transfer));
+                CUDA_CHECK(cudaEventRecord(ev_h2d_done[next_buf_idx], stream_transfer));
             }
 
             // Compute current batch (overlaps với next batch transfer)
-            // OPTIMIZATION: Chỉ compute loss mỗi 200 batches để giảm sync overhead
-            // Loss computation cần sync stream → overhead lớn
-            // Compute loss ở đầu, giữa, và cuối epoch để có avg_loss chính xác
-            bool compute_loss = (b == 0) || (b == num_batches / 2) || (b == num_batches - 1);
-            float batch_loss = 0.0f;
-            
-            ae.train_step(d_batch_input_buf[buf_idx], d_batch_recon_buf[buf_idx],
-                          current_compute_stream, compute_loss, &batch_loss);
+            // Tính loss mỗi 5 batches để có curve mượt hơn (~156 samples/epoch)
+            bool compute_loss = (b % 5 == 0);
             
             if (compute_loss) {
-                epoch_loss_sum += batch_loss;
-                loss_samples++;
+                // Use async loss: loss computed on stream_loss, overlaps with next batch
+                ae.train_step_async_loss(
+                    d_batch_input_buf[buf_idx], d_batch_recon_buf[buf_idx],
+                    current_compute_stream,
+                    d_loss_buf[buf_idx], h_loss_buf[buf_idx],
+                    ev_compute_done[buf_idx], ev_loss_done[buf_idx],
+                    stream_loss);
+                
+                // Track loss batch info for later collection (avoid blocking here)
+                loss_batches.push_back({b, buf_idx});
+            } else {
+                // Normal train step without loss
+                ae.train_step(d_batch_input_buf[buf_idx], d_batch_recon_buf[buf_idx],
+                              current_compute_stream, false, nullptr);
+                // CRITICAL: Record compute completion event (cần cho race condition fix)
+                CUDA_CHECK(cudaEventRecord(ev_compute_done[buf_idx], current_compute_stream));
             }
         }
         
         // Wait for all streams to complete
         CUDA_CHECK(cudaStreamSynchronize(stream_compute[0]));
         CUDA_CHECK(cudaStreamSynchronize(stream_compute[1]));
+        CUDA_CHECK(cudaStreamSynchronize(stream_compute[2]));
         CUDA_CHECK(cudaStreamSynchronize(stream_transfer));
+        CUDA_CHECK(cudaStreamSynchronize(stream_loss));
+        
+        // FIX CRITICAL: Collect losses after all streams complete (non-blocking during training)
+        // Track by (batch_idx, buf_idx) to avoid overwrite issues
+        float epoch_loss_sum = 0.0f;
+        int loss_samples = 0;
+        for (const auto& loss_info : loss_batches) {
+            int batch_idx = loss_info.first;
+            int buf_idx = loss_info.second;
+            // Loss should already be ready (stream_loss synchronized)
+            int batch_size_for_loss = std::min(batch_size, num_train - batch_idx * batch_size);
+            int total_elements = batch_size_for_loss * CIFAR10Loader::IMAGE_SIZE;
+            float batch_loss = h_loss_buf[buf_idx][0] / static_cast<float>(total_elements);
+            epoch_loss_sum += batch_loss;
+            loss_samples++;
+        }
 
         auto end_epoch = std::chrono::high_resolution_clock::now();
         auto epoch_time = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -209,15 +273,29 @@ int main() {
     CUDA_CHECK(cudaFreeHost(h_pinned_batch));  // Free pinned memory
     CUDA_CHECK(cudaFreeHost(h_pinned_batch_buf[0]));
     CUDA_CHECK(cudaFreeHost(h_pinned_batch_buf[1]));
+    CUDA_CHECK(cudaFreeHost(h_pinned_batch_buf[2]));
     CUDA_CHECK(cudaFree(d_batch_input));
     CUDA_CHECK(cudaFree(d_batch_recon));
     CUDA_CHECK(cudaFree(d_batch_input_buf[0]));
     CUDA_CHECK(cudaFree(d_batch_input_buf[1]));
+    CUDA_CHECK(cudaFree(d_batch_input_buf[2]));
     CUDA_CHECK(cudaFree(d_batch_recon_buf[0]));
     CUDA_CHECK(cudaFree(d_batch_recon_buf[1]));
+    CUDA_CHECK(cudaFree(d_batch_recon_buf[2]));
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaFree(d_loss_buf[i]));
+        CUDA_CHECK(cudaFreeHost(h_loss_buf[i]));
+    }
     CUDA_CHECK(cudaStreamDestroy(stream_compute[0]));
     CUDA_CHECK(cudaStreamDestroy(stream_compute[1]));
+    CUDA_CHECK(cudaStreamDestroy(stream_compute[2]));
     CUDA_CHECK(cudaStreamDestroy(stream_transfer));
+    CUDA_CHECK(cudaStreamDestroy(stream_loss));
+    for (int i = 0; i < 3; ++i) {
+        CUDA_CHECK(cudaEventDestroy(ev_h2d_done[i]));
+        CUDA_CHECK(cudaEventDestroy(ev_compute_done[i]));
+        CUDA_CHECK(cudaEventDestroy(ev_loss_done[i]));
+    }
 
     return 0;
 }

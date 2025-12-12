@@ -44,6 +44,7 @@ AutoencoderGPU::AutoencoderGPU(int N, int H, int W, float lr)
       d_dconv3_(nullptr), d_drelu3_(nullptr), d_dup1_(nullptr),
       d_dconv4_(nullptr), d_drelu4_(nullptr), d_dup2_(nullptr),
       d_dconv5_(nullptr),
+      d_dinput1_(nullptr),
       d_drecon_(nullptr) {
 
     // Tính kích thước các layer
@@ -112,6 +113,8 @@ AutoencoderGPU::AutoencoderGPU(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMalloc(&d_drelu4_, N_ * C4_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dup2_, N_ * C4_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dconv5_, N_ * C5_ * H_ * W_ * sizeof(float)));
+    // Buffer riêng cho dL/dInput của Conv1
+    CUDA_CHECK(cudaMalloc(&d_dinput1_, N_ * C_in_ * H_ * W_ * sizeof(float)));
 
     // Allocate reusable buffer for dL/d(recon) to avoid per-iteration malloc/free
     int total_output = N_ * C5_ * H_ * W_;
@@ -192,6 +195,7 @@ AutoencoderGPU::~AutoencoderGPU() {
     CUDA_CHECK(cudaFree(d_dconv3_)); CUDA_CHECK(cudaFree(d_drelu3_)); CUDA_CHECK(cudaFree(d_dup1_));
     CUDA_CHECK(cudaFree(d_dconv4_)); CUDA_CHECK(cudaFree(d_drelu4_)); CUDA_CHECK(cudaFree(d_dup2_));
     CUDA_CHECK(cudaFree(d_dconv5_));
+    CUDA_CHECK(cudaFree(d_dinput1_));
     CUDA_CHECK(cudaFree(d_drecon_));
 }
 
@@ -366,10 +370,10 @@ void AutoencoderGPU::backward(const float* d_input,
     // 12) ReLU1 backward: d_drelu1_ -> d_dconv1_ (đúng thứ tự!)
     relu_backward_gpu(d_drelu1_, d_relu1_, d_dconv1_, N_ * C1_ * H_ * W_);
 
-    // 13) Conv1 backward: d_dconv1_ -> d_dinput (không cần output nhưng cần buffer hợp lệ)
+    // 13) Conv1 backward: d_dconv1_ -> d_dinput1_
     conv2d_backward_gpu_naive(
         d_dconv1_, d_input, d_w1_,
-        d_dconv1_, d_dw1_, d_db1_,  // d_dinput dùng lại buffer d_dconv1_ (không cần output)
+        d_dinput1_, d_dw1_, d_db1_,
         N_, C_in_, H_, W_, C1_, K_);
 }
 

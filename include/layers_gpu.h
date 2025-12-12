@@ -76,6 +76,16 @@ float mse_loss_forward_gpu(
     int total_elements,
     cudaStream_t stream = 0);
 
+// MSE Loss forward async: uses pre-allocated buffers, returns immediately
+// Caller must sync stream_loss and divide by total_elements
+void mse_loss_forward_gpu_async(
+    const float* d_pred,
+    const float* d_target,
+    int total_elements,
+    float* d_loss_buf,  // Pre-allocated device buffer (must be zeroed)
+    float* h_loss_buf,  // Host buffer to receive result
+    cudaStream_t stream_loss);
+
 // MSE Loss backward: gradient theo pred
 void mse_loss_backward_gpu(
     const float* d_pred,
