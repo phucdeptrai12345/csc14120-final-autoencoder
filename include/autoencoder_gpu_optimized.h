@@ -93,6 +93,10 @@ private:
     float *d_w3_, *d_b3_;
     float *d_w4_, *d_b4_;
     float *d_w5_, *d_b5_;
+    
+    // Constant memory for biases (faster broadcast access)
+    // Note: Constant memory limited to 64KB total, but we only store biases (small)
+    // C1=256, C2=128, C3=128, C4=256, C5=3 = 771 floats = 3KB (well within limit)
 
     // Gradients (device)
     float *d_dw1_, *d_db1_;
@@ -136,8 +140,17 @@ private:
     bool use_mixed_precision_;
     bool gpu_supports_fp16_;
     
+    // Constant memory strategy: separate training/inference paths
+    // Training: use global memory (bias changes every step) - no constant memory update
+    // Inference: use constant memory (bias static) - update once
+    bool is_training_mode_;
+    bool constant_memory_updated_;  // Track if constant memory is up-to-date for inference
+    
     // Helper: Check GPU FP16 support
     bool check_fp16_support();
+    
+    // Set training/inference mode
+    void set_training_mode(bool is_training) { is_training_mode_ = is_training; }
 };
 
 #endif // AUTOENCODER_GPU_OPTIMIZED_H

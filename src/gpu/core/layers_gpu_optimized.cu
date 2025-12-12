@@ -6,6 +6,15 @@
 #include <cublas_v2.h>
 #include <cstdio>
 #include <cstddef>
+#include <vector>
+
+// Constant memory for biases
+__constant__ float c_bias_all[256 + 128 + 128 + 256 + 3];
+#define C_BIAS1_OFFSET 0
+#define C_BIAS2_OFFSET 256
+#define C_BIAS3_OFFSET 384
+#define C_BIAS4_OFFSET 512
+#define C_BIAS5_OFFSET 768
 
 #define CUDA_CHECK(cmd) \
     do { \
@@ -16,15 +25,6 @@
         } \
     } while (0)
 
-// Forward declaration for vectorized kernel
-__global__ void conv2d_relu_fused_vectorized_kernel(
-    const float* __restrict__ input,
-    const float* __restrict__ weight,
-    const float* __restrict__ bias,
-    float* __restrict__ output,
-    int N, int C_in, int H, int W,
-    int C_out, int K);
-
 // GEMM path: im2col + cuBLAS + bias + ReLU
 __global__ void im2col_kernel(
     const float* __restrict__ data_im,
@@ -33,7 +33,7 @@ __global__ void im2col_kernel(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int HW = H * W;
-    int total_cols = N * HW; // one column per (n,h,w)
+    int total_cols = N * HW;
     if (idx >= total_cols) return;
 
     int n = idx / HW;
@@ -42,9 +42,8 @@ __global__ void im2col_kernel(
     int w = m % W;
     int pad = K / 2;
 
-    // Write C*K*K values for this column
     int K2 = K * K;
-    int col_base = idx; // column index
+    int col_base = idx;
     for (int c = 0; c < C; ++c) {
         for (int kh = 0; kh < K; ++kh) {
             for (int kw = 0; kw < K; ++kw) {
@@ -55,8 +54,7 @@ __global__ void im2col_kernel(
                     int im_idx = ((n * C + c) * H + ih) * W + iw;
                     val = data_im[im_idx];
                 }
-                int k_idx = (c * K2) + kh * K + kw; // [0, C*K*K)
-                // data_col layout: (C*K*K) rows, (N*H*W) cols, column-major stride by rows
+                int k_idx = (c * K2) + kh * K + kw;
                 data_col[k_idx * total_cols + col_base] = val;
             }
         }
@@ -146,7 +144,7 @@ __global__ void im2col_fp16_kernel(
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int HW = H * W;
-    int total_cols = N * HW; // one column per (n,h,w)
+    int total_cols = N * HW;
     if (idx >= total_cols) return;
 
     int n = idx / HW;
@@ -253,14 +251,58 @@ __global__ void col2im_kernel_noatomic(
     data_im[idx] = sum;
 }
 
-__global__ void bias_grad_kernel(const float* __restrict__ d_out, float* __restrict__ d_dbias,
-                                 int N, int C_out, int H, int W)
+// Warp-level reduction helper (faster than shared memory)
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// Optimized warp-level reduction for bias gradient
+__global__ void bias_grad_warp_kernel(const float* __restrict__ d_out, float* __restrict__ d_dbias,
+                                      int N, int C_out, int H, int W)
 {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane_id = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
     int total = N * C_out * H * W;
-    if (idx >= total) return;
-    int c = (idx / (H * W)) % C_out;
-    atomicAdd(&d_dbias[c], d_out[idx]);
+    
+    // Shared memory for per-channel accumulation within block
+    extern __shared__ float s_channel_sums[];
+    
+    // Initialize shared memory (cooperative by all threads)
+    for (int i = threadIdx.x; i < C_out; i += blockDim.x) {
+        s_channel_sums[i] = 0.0f;
+    }
+    __syncthreads();
+    
+    // Each thread processes its element
+    if (tid < total) {
+        float val = d_out[tid];
+        int c = (tid / (H * W)) % C_out;
+        
+        // Accumulate in shared memory (atomic within block is faster than global atomic)
+        atomicAdd(&s_channel_sums[c], val);
+    }
+    
+    __syncthreads();
+    
+    // Warp-level reduction: reduce shared memory sums within warp, then atomic add to global
+    // Each warp processes a subset of channels
+    for (int c = warp_id * 32 + lane_id; c < C_out; c += blockDim.x / 32 * 32) {
+        float channel_sum = s_channel_sums[c];
+        
+        // Reduce within warp if multiple warps process same channel range
+        // (This is less common, but helps when C_out is small)
+        channel_sum = warp_reduce_sum(channel_sum);
+        
+        // First thread in warp atomic adds to global
+        if (lane_id == 0 && channel_sum != 0.0f) {
+            atomicAdd(&d_dbias[c], channel_sum);
+        }
+    }
 }
 
 void conv2d_backward_gpu_gemm(
@@ -329,15 +371,57 @@ void conv2d_backward_gpu_gemm(
     grid = (total + block - 1) / block;
     col2im_kernel_noatomic<<<grid, block, 0, stream>>>(d_im2col, d_dinput, N, C_in, H, W, K);
 
-    // 5) bias grad
+    // 5) bias grad (using warp-level reduction for better performance)
     int total_out = N * C_out * H * W;
     grid = (total_out + block - 1) / block;
-    bias_grad_kernel<<<grid, block, 0, stream>>>(d_out, d_dbias, N, C_out, H, W);
+    size_t shared_size = C_out * sizeof(float);  // Per-channel accumulation
+    bias_grad_warp_kernel<<<grid, block, shared_size, stream>>>(d_out, d_dbias, N, C_out, H, W);
 
     CUDA_CHECK(cudaGetLastError());
 }
 
 // Kernel fallback: dùng bias từ global khi C_out > 512
+// Kernel with constant memory bias (faster broadcast access)
+__global__ void conv2d_relu_fused_kernel_bias_const(
+    const float* __restrict__ input,
+    const float* __restrict__ weight,
+    int bias_offset,  // Offset into constant memory
+    float* __restrict__ output,
+    int N, int C_in, int H, int W,
+    int C_out, int K)
+{
+    int n  = blockIdx.z;
+    int co = blockIdx.y;
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int HW = H * W;
+    if (idx >= HW) return;
+    int h = idx / W;
+    int w = idx % W;
+    int pad = K / 2;
+    float sum = 0.0f;
+    #pragma unroll
+    for (int ci = 0; ci < C_in; ++ci) {
+        #pragma unroll
+        for (int kh = 0; kh < 3; ++kh) {
+            #pragma unroll
+            for (int kw = 0; kw < 3; ++kw) {
+                int ih = h + kh - pad;
+                int iw = w + kw - pad;
+                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
+                    int input_idx = ((n * C_in + ci) * H + ih) * W + iw;
+                    int weight_idx = ((co * C_in + ci) * K + kh) * K + kw;
+                    sum += input[input_idx] * weight[weight_idx];
+                }
+            }
+        }
+    }
+    sum += c_bias_all[bias_offset + co];
+    sum = fmaxf(sum, 0.0f);
+    int out_idx = ((n * C_out + co) * H + h) * W + w;
+    output[out_idx] = sum;
+}
+
+// Original kernel with global memory bias (kept for fallback)
 __global__ void conv2d_relu_fused_kernel_bias(
     const float* __restrict__ input,
     const float* __restrict__ weight,
@@ -377,6 +461,21 @@ __global__ void conv2d_relu_fused_kernel_bias(
     output[out_idx] = sum;
 }
 
+// ============================================
+// KERNEL SELECTION STRATEGY
+// ============================================
+// This function implements a multi-level kernel selection strategy:
+//
+// Level 1: Constant Memory vs Global Memory
+//   - Training: use_constant_memory = false → global memory (bias changes every step)
+//   - Inference: use_constant_memory = true → constant memory (bias static, faster broadcast)
+//   - Rationale: Constant memory provides faster broadcast access but requires D2H copy to update
+//
+// Level 3: Block Size Tuning
+//   - Small HW (<256): 128 threads/block (better occupancy)
+//   - Medium HW (<1024): 128 threads/block
+//   - Large HW (>=1024): 256 threads/block (better throughput)
+//
 void conv2d_relu_forward_gpu_fused(
     const float* d_input,
     const float* d_weight,
@@ -384,20 +483,34 @@ void conv2d_relu_forward_gpu_fused(
     float* d_output,
     int N, int C_in, int H, int W,
     int C_out, int K,
-    cudaStream_t stream)
+    cudaStream_t stream,
+    bool use_constant_memory)
 {
-    // Dùng hoàn toàn global memory để luôn đồng bộ với SGD updates (bỏ nhánh constant Conv1).
     int HW = H * W;
     int block_size = (HW < 256) ? 128 : (HW < 1024) ? 128 : 256;
+    
+    // Level 1: Determine bias offset for constant memory (if enabled)
+    int bias_offset = -1;
+    if (use_constant_memory) {
+        // Map layer dimensions to constant memory offsets
+        if (C_in == 3 && C_out == 256) bias_offset = C_BIAS1_OFFSET;      // Conv1: 3→256
+        else if (C_in == 256 && C_out == 128) bias_offset = C_BIAS2_OFFSET;  // Conv2: 256→128
+        else if (C_in == 128 && C_out == 128) bias_offset = C_BIAS3_OFFSET;  // Conv3: 128→128
+        else if (C_in == 128 && C_out == 256) bias_offset = C_BIAS4_OFFSET;  // Conv4: 128→256
+        else if (C_out == 3) bias_offset = C_BIAS5_OFFSET;    // Conv5: 256→3
+    }
+    
     dim3 block(block_size);
     dim3 grid((HW + block.x - 1) / block.x, C_out, N);
-
-    // Chọn kernel vectorized khi C_in bội số của 4, ngược lại dùng kernel bias thông thường.
-    if (C_in >= 4 && (C_in % 4 == 0) && C_out <= 512) {
-        conv2d_relu_fused_vectorized_kernel<<<grid, block, 0, stream>>>(
-            d_input, d_weight, d_bias, d_output,
+    
+    // Use constant memory kernel if bias_offset is valid, otherwise use standard kernel
+    if (bias_offset >= 0) {
+        // Constant memory kernel: faster broadcast access, no global memory read for bias
+        conv2d_relu_fused_kernel_bias_const<<<grid, block, 0, stream>>>(
+            d_input, d_weight, bias_offset, d_output,
             N, C_in, H, W, C_out, K);
     } else {
+        // Standard kernel: fallback when constant memory is not available
         conv2d_relu_fused_kernel_bias<<<grid, block, 0, stream>>>(
             d_input, d_weight, d_bias, d_output,
             N, C_in, H, W, C_out, K);
@@ -514,8 +627,8 @@ __global__ void conv2d_backward_input_optimized_kernel(
             for (int kh = 0; kh < 3; ++kh) {
                 #pragma unroll
                 for (int kw = 0; kw < 3; ++kw) {
-                    int h_out = h - kh + pad;
-                    int w_out = w - kw + pad;
+                    int h_out = h + kh - pad;  // Flip kernel: +kh instead of -kh
+                    int w_out = w + kw - pad;  // Flip kernel: +kw instead of -kw
                     if (h_out >= 0 && h_out < H && w_out >= 0 && w_out < W) {
                         int out_idx = ((n * C_out + co) * H + h_out) * W + w_out;
                         float grad_out = d_out[out_idx];
@@ -577,8 +690,6 @@ void conv2d_backward_gpu_optimized(
 
     CUDA_CHECK(cudaGetLastError());
 }
-
-// Pinned memory helpers removed - training code uses cudaMallocHost/cudaFreeHost directly
 
 // Optimized pooling with coalesced access
 __global__ void maxpool2d_forward_optimized_kernel(
@@ -694,86 +805,22 @@ void upsample2d_forward_gpu_optimized(
 }
 
 
-// Vectorized memory access for convolution
-__global__ void conv2d_relu_fused_vectorized_kernel(
-    const float* __restrict__ input,
-    const float* __restrict__ weight,
-    const float* __restrict__ bias,
-    float* __restrict__ output,
-    int N, int C_in, int H, int W,
-    int C_out, int K)
+// Helper function to update constant memory biases
+void update_constant_memory_biases(
+    const float* d_b1, int c1,
+    const float* d_b2, int c2,
+    const float* d_b3, int c3,
+    const float* d_b4, int c4,
+    const float* d_b5, int c5,
+    cudaStream_t stream)
 {
-    int n  = blockIdx.z;
-    int co = blockIdx.y;
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int HW = H * W;
-    if (idx >= HW) return;
-    int h = idx / W;
-    int w = idx % W;
-    int pad = K / 2;
-    
-    // Vectorized accumulation: process 4 channels at once when possible
-    float sum = 0.0f;
-    int ci_base = 0;
-    
-    // Process channels in groups of 4 for better coalescing
-    for (; ci_base + 4 <= C_in; ci_base += 4) {
-        #pragma unroll
-        for (int kh = 0; kh < 3; ++kh) {
-            #pragma unroll
-            for (int kw = 0; kw < 3; ++kw) {
-                int ih = h + kh - pad;
-                int iw = w + kw - pad;
-                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                    // Use scalar access to avoid alignment issues
-                    // Vectorized access requires careful memory layout which may not be guaranteed
-                    int idx0 = ((n * C_in + ci_base + 0) * H + ih) * W + iw;
-                    int idx1 = ((n * C_in + ci_base + 1) * H + ih) * W + iw;
-                    int idx2 = ((n * C_in + ci_base + 2) * H + ih) * W + iw;
-                    int idx3 = ((n * C_in + ci_base + 3) * H + ih) * W + iw;
-                    
-                    float in0 = input[idx0];
-                    float in1 = input[idx1];
-                    float in2 = input[idx2];
-                    float in3 = input[idx3];
-                    
-                    // Load weights for 4 channels
-                    float w0 = weight[((co * C_in + ci_base + 0) * K + kh) * K + kw];
-                    float w1 = weight[((co * C_in + ci_base + 1) * K + kh) * K + kw];
-                    float w2 = weight[((co * C_in + ci_base + 2) * K + kh) * K + kw];
-                    float w3 = weight[((co * C_in + ci_base + 3) * K + kh) * K + kw];
-                    
-                    sum += in0 * w0 + in1 * w1 + in2 * w2 + in3 * w3;
-                }
-            }
-        }
-    }
-    
-    // Handle remaining channels
-    #pragma unroll
-    for (int ci = ci_base; ci < C_in; ++ci) {
-        #pragma unroll
-        for (int kh = 0; kh < 3; ++kh) {
-            #pragma unroll
-            for (int kw = 0; kw < 3; ++kw) {
-                int ih = h + kh - pad;
-                int iw = w + kw - pad;
-                if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
-                    int input_idx = ((n * C_in + ci) * H + ih) * W + iw;
-                    int weight_idx = ((co * C_in + ci) * K + kh) * K + kw;
-                    sum += input[input_idx] * weight[weight_idx];
-                }
-            }
-        }
-    }
-    
-    sum += bias[co];
-    sum = fmaxf(sum, 0.0f);
-    int out_idx = ((n * C_out + co) * H + h) * W + w;
-    output[out_idx] = sum;
+    std::vector<float> h_bias_all(256 + 128 + 128 + 256 + 3);
+    CUDA_CHECK(cudaMemcpyAsync(h_bias_all.data() + 0, d_b1, c1 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_bias_all.data() + 256, d_b2, c2 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_bias_all.data() + 384, d_b3, c3 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_bias_all.data() + 512, d_b4, c4 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(h_bias_all.data() + 768, d_b5, c5 * sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaMemcpyToSymbol(c_bias_all, h_bias_all.data(), h_bias_all.size() * sizeof(float)));
 }
-
-// conv2d_relu_forward_gpu_fused_vectorized wrapper removed - vectorized kernel is called directly from conv2d_relu_forward_gpu_fused()
-
-// Mixed precision FP16 fused kernels removed - code uses GEMM FP16 instead (conv2d_relu_forward_gemm_fp16)
 

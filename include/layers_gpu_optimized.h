@@ -17,7 +17,8 @@ void conv2d_relu_forward_gpu_fused(
     float* d_output,
     int N, int C_in, int H, int W,
     int C_out, int K,
-    cudaStream_t stream = 0);
+    cudaStream_t stream = 0,
+    bool use_constant_memory = false);  // Training: false (use global), Inference: true (use constant)
 
 // GEMM path: im2col + cuBLAS + bias+ReLU (FP32)
 void conv2d_relu_forward_gemm(
@@ -129,6 +130,16 @@ void upsample2d_forward_gpu_optimized(
     const float* d_input,
     float* d_output,
     int N, int C, int H, int W,
+    cudaStream_t stream = 0);
+
+// Constant memory helper: Update biases in constant memory
+// Layout: [b1(256), b2(128), b3(128), b4(256), b5(3)] = 771 floats
+void update_constant_memory_biases(
+    const float* d_b1, int c1,
+    const float* d_b2, int c2,
+    const float* d_b3, int c3,
+    const float* d_b4, int c4,
+    const float* d_b5, int c5,
     cudaStream_t stream = 0);
 
 // OPTIMIZATION 13: Mixed Precision (FP16/FP32)

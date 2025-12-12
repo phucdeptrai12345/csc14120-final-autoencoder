@@ -12,7 +12,6 @@
 #include "layers_gpu_optimized.h"
 #include "layers_gpu.h"
 
-
 #define CUDA_CHECK(cmd) \
     do { \
         cudaError_t e = (cmd); \
@@ -61,14 +60,15 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
       d_im2col_fp16_(nullptr),
       cublas_handle_(nullptr),
       use_mixed_precision_(false),
-      gpu_supports_fp16_(false)
+      gpu_supports_fp16_(false),
+      is_training_mode_(true),  // Default to training mode
+      constant_memory_updated_(false)
 {
     int H16 = H_ / 2;
     int W16 = W_ / 2;
     int H8 = H_ / 4;
     int W8 = W_ / 4;
 
-    // === ALLOCATE WEIGHTS & BIASES ===
     CUDA_CHECK(cudaMalloc(&d_w1_, C1_ * C_in_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_b1_, C1_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_w2_, C2_ * C1_ * K_ * K_ * sizeof(float)));
@@ -80,7 +80,6 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMalloc(&d_w5_, C5_ * C4_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_b5_, C5_ * sizeof(float)));
 
-    // === ALLOCATE GRADIENTS ===
     CUDA_CHECK(cudaMalloc(&d_dw1_, C1_ * C_in_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_db1_, C1_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dw2_, C2_ * C1_ * K_ * K_ * sizeof(float)));
@@ -92,7 +91,6 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMalloc(&d_dw5_, C5_ * C4_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_db5_, C5_ * sizeof(float)));
 
-    // === ALLOCATE ACTIVATIONS ===
     CUDA_CHECK(cudaMalloc(&d_relu1_, N_ * C1_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_pool1_, N_ * C1_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu2_, N_ * C2_ * H16 * W16 * sizeof(float)));
@@ -104,7 +102,6 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMalloc(&d_up2_, N_ * C4_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_conv5_, N_ * C5_ * H_ * W_ * sizeof(float)));
 
-    // === ALLOCATE ACTIVATION GRADIENTS ===
     CUDA_CHECK(cudaMalloc(&d_dconv1_, N_ * C1_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_drelu1_, N_ * C1_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dpool1_, N_ * C1_ * H16 * W16 * sizeof(float)));
@@ -120,17 +117,13 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMalloc(&d_dup2_, N_ * C4_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dconv5_, N_ * C5_ * H_ * W_ * sizeof(float)));
     
-    // === REUSABLE BUFFERS ===
     int total_output = N_ * C5_ * H_ * W_;
     CUDA_CHECK(cudaMalloc(&d_drecon_, total_output * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dinput_temp_, N_ * C_in_ * H_ * W_ * sizeof(float)));
 
-    // === ALLOCATE GEMM WORKSPACES ===
-    // im2col max (Conv2 dominates): N * C1 * K*K * H16 * W16
     size_t im2col_max = static_cast<size_t>(N_) * C1_ * K_ * K_ * (H16 * W16);
     size_t im2col_bytes = im2col_max * sizeof(float);
     CUDA_CHECK(cudaMalloc(&d_im2col_, im2col_bytes));
-    // GEMM out max across Conv1-4
     size_t out_max = static_cast<size_t>(N_) * std::max({
         C1_ * H_ * W_,
         C2_ * H16 * W16,
@@ -140,10 +133,8 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
     size_t out_bytes = out_max * sizeof(float);
     CUDA_CHECK(cudaMalloc(&d_gemm_out_, out_bytes));
 
-    // === cuBLAS handle ===
     cublasCreate(&cublas_handle_);
 
-    // === INITIALIZE WEIGHTS (Glorot) ===
     int k2 = K_ * K_;
     std::vector<float> h_w1(C1_ * C_in_ * k2);
     std::vector<float> h_w2(C2_ * C1_ * k2);
@@ -171,7 +162,11 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMemcpy(d_b4_, h_b4.data(), h_b4.size() * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_b5_, h_b5.data(), h_b5.size() * sizeof(float), cudaMemcpyHostToDevice));
     
-    // === CHECK GPU FP16 SUPPORT ===
+    update_constant_memory_biases(d_b1_, C1_, d_b2_, C2_, d_b3_, C3_, d_b4_, C4_, d_b5_, C5_, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    printf("✓ Biases copied to constant memory for faster broadcast access\n");
+    constant_memory_updated_ = true;
+
     gpu_supports_fp16_ = check_fp16_support();
     use_mixed_precision_ = gpu_supports_fp16_;  // Auto-enable if GPU supports
     // Allow runtime override for benchmarking:
@@ -183,10 +178,8 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
     if (std::getenv("FORCE_FP16") && gpu_supports_fp16_) {
         use_mixed_precision_ = true;
     }
-    
-    // === ALLOCATE FP16 BUFFERS (if mixed precision enabled) ===
+
     if (use_mixed_precision_) {
-        // Allocate FP16 im2col buffer for GEMM FP16 (Conv2-4)
         CUDA_CHECK(cudaMalloc(&d_im2col_fp16_, im2col_max * sizeof(__half)));
         printf("✓ Mixed Precision (FP16/FP32) enabled - GPU supports FP16\n");
         printf("  Strategy: Conv1 dùng FP32 (spatial nhỏ), Conv2-4 dùng FP16 GEMM (Tensor Cores)\n");
@@ -257,13 +250,29 @@ void AutoencoderGPUOptimized::forward(const float* d_input, float* d_recon, cuda
     
     bool use_fp16 = (use_mixed_precision_ && gpu_supports_fp16_);
     
-    // ENCODER
+    // Inference mode: update constant memory once if not updated
+    // Training mode: skip constant memory (use global memory kernels)
+    if (!is_training_mode_ && !constant_memory_updated_) {
+        update_constant_memory_biases(d_b1_, C1_, d_b2_, C2_, d_b3_, C3_, d_b4_, C4_, d_b5_, C5_, stream);
+        constant_memory_updated_ = true;
+    }
+    
+    // ============================================
+    // FORWARD PASS - KERNEL SELECTION STRATEGY
+    // ============================================
+    // ENCODER PATH:
+    // Conv1: Fused kernel (Conv+ReLU) - small spatial size (32x32), use fused for efficiency
+    //   - Training: global memory (bias changes)
+    //   - Inference: constant memory (bias static)
     conv2d_relu_forward_gpu_fused(
         d_input, d_w1_, d_b1_, d_relu1_,
-        N_, C_in_, H_, W_, C1_, K_, stream);
+        N_, C_in_, H_, W_, C1_, K_, stream, !is_training_mode_);
     
     maxpool2d_forward_gpu_optimized(d_relu1_, d_pool1_, N_, C1_, H_, W_, stream);
     
+    // Conv2: GEMM-based (im2col + cuBLAS) - large channels (256→128), GEMM is faster
+    //   - FP16: if GPU supports Tensor Cores (2x faster on Volta+)
+    //   - FP32: fallback for older GPUs
     if (use_fp16) {
         conv2d_relu_forward_gemm_fp16(
             d_pool1_, d_w2_, d_b2_, d_relu2_,
@@ -278,7 +287,8 @@ void AutoencoderGPUOptimized::forward(const float* d_input, float* d_recon, cuda
     
     maxpool2d_forward_gpu_optimized(d_relu2_, d_pool2_, N_, C2_, H16, W16, stream);
     
-    // DECODER
+    // DECODER PATH:
+    // Conv3: GEMM-based (same strategy as Conv2)
     if (use_fp16) {
         conv2d_relu_forward_gemm_fp16(
             d_pool2_, d_w3_, d_b3_, d_relu3_,
@@ -293,6 +303,7 @@ void AutoencoderGPUOptimized::forward(const float* d_input, float* d_recon, cuda
     
     upsample2d_forward_gpu_optimized(d_relu3_, d_up1_, N_, C3_, H8, W8, stream);
     
+    // Conv4: GEMM-based (same strategy as Conv2-3)
     if (use_fp16) {
         conv2d_relu_forward_gemm_fp16(
             d_up1_, d_w4_, d_b4_, d_relu4_,
@@ -307,6 +318,7 @@ void AutoencoderGPUOptimized::forward(const float* d_input, float* d_recon, cuda
     
     upsample2d_forward_gpu_optimized(d_relu4_, d_up2_, N_, C4_, H16, W16, stream);
     
+    // Conv5: Naive kernel (no ReLU) - small channels (256→3), naive is sufficient
     conv2d_forward_gpu_naive(
         d_up2_, d_w5_, d_b5_, d_recon,
         N_, C4_, H_, W_, C5_, K_, stream);
@@ -321,9 +333,15 @@ void AutoencoderGPUOptimized::extract_features(const float* d_input, float* d_fe
     
     bool use_fp16 = (use_mixed_precision_ && gpu_supports_fp16_);
     
+    // Inference mode: update constant memory once if not updated
+    if (!constant_memory_updated_) {
+        update_constant_memory_biases(d_b1_, C1_, d_b2_, C2_, d_b3_, C3_, d_b4_, C4_, d_b5_, C5_, stream);
+        constant_memory_updated_ = true;
+    }
+    
     conv2d_relu_forward_gpu_fused(
         d_input, d_w1_, d_b1_, d_relu1_,
-        N_, C_in_, H_, W_, C1_, K_, stream);
+        N_, C_in_, H_, W_, C1_, K_, stream, true);  // Inference: use constant memory
     
     maxpool2d_forward_gpu_optimized(d_relu1_, d_pool1_, N_, C1_, H_, W_, stream);
     
@@ -351,6 +369,7 @@ float AutoencoderGPUOptimized::train_step(const float* d_input, float* d_recon,
                                           cudaStream_t stream,
                                           bool compute_loss_host,
                                           float* h_loss_out) {
+    is_training_mode_ = true;
     forward(d_input, d_recon, stream);
     int total = N_ * C5_ * H_ * W_;
     mse_loss_backward_gpu(d_recon, d_input, d_drecon_, total, stream);
@@ -371,6 +390,7 @@ void AutoencoderGPUOptimized::train_step_async_loss(const float* d_input, float*
                                                     cudaEvent_t ev_compute_done,
                                                     cudaEvent_t ev_loss_done,
                                                     cudaStream_t stream_loss) {
+    is_training_mode_ = true;  // Set training mode
     forward(d_input, d_recon, stream_compute);
     int total = N_ * C5_ * H_ * W_;
     mse_loss_backward_gpu(d_recon, d_input, d_drecon_, total, stream_compute);
@@ -541,12 +561,6 @@ void AutoencoderGPUOptimized::backward(const float* d_input,
         N_, C_in_, H_, W_, C1_, K_, stream);
 }
 
-__global__ void sgd_update_kernel(float* param, const float* grad, float lr, int N) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= N) return;
-    param[idx] -= lr * grad[idx];
-}
-
 void AutoencoderGPUOptimized::step(cudaStream_t stream) {
     int n_w1 = C1_ * C_in_ * K_ * K_;
     int n_w2 = C2_ * C1_ * K_ * K_;
@@ -571,6 +585,10 @@ void AutoencoderGPUOptimized::step(cudaStream_t stream) {
         lr_);
     
     CUDA_CHECK(cudaGetLastError());
+    
+    // Training mode: do NOT update constant memory (bias changes every step)
+    // Constant memory only used for inference (bias static)
+    // This eliminates overhead during training
 }
 
 // Save/Load weights
@@ -710,4 +728,8 @@ void AutoencoderGPUOptimized::load_weights(const std::string& filepath) {
     CUDA_CHECK(cudaMemcpy(d_b4_, h_b4.data(), C4_ * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_w5_, h_w5.data(), n_w5 * sizeof(float), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_b5_, h_b5.data(), C5_ * sizeof(float), cudaMemcpyHostToDevice));
+    
+    update_constant_memory_biases(d_b1_, C1_, d_b2_, C2_, d_b3_, C3_, d_b4_, C4_, d_b5_, C5_, 0);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    constant_memory_updated_ = true;
 }
