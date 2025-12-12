@@ -117,7 +117,7 @@ int main() {
     CUDA_CHECK(cudaMemcpy(d_batch_input, h_pinned_batch,
                          test_copy_size * sizeof(float),
                          cudaMemcpyHostToDevice));
-    float test_loss = ae.train_step(d_batch_input, d_batch_recon, test_batch_size);
+    float test_loss = ae.train_step(d_batch_input, d_batch_recon);
     std::cout << " ✓ Done (test loss: " << test_loss << ")\n" << std::flush;
 
     // 5b. Warmup vài batch trước khi đo thời gian (ổn định xung GPU)
@@ -125,14 +125,13 @@ int main() {
     for (int w = 0; w < warmup_batches; ++w) {
         int start_idx = w * batch_size;
         int copy_size = std::min(batch_size, num_train - start_idx) * CIFAR10Loader::IMAGE_SIZE;
-        int this_batch_size = std::min(batch_size, num_train - start_idx);
         std::memcpy(h_pinned_batch,
                    &train_images[start_idx * CIFAR10Loader::IMAGE_SIZE],
                    copy_size * sizeof(float));
         CUDA_CHECK(cudaMemcpy(d_batch_input, h_pinned_batch,
                              copy_size * sizeof(float),
                              cudaMemcpyHostToDevice));
-        ae.train_step(d_batch_input, d_batch_recon, this_batch_size);
+        ae.train_step(d_batch_input, d_batch_recon);
     }
 
     // 6. Training loop
@@ -195,7 +194,7 @@ int main() {
                 CUDA_CHECK(cudaEventRecord(ev_h2d_done[next_buf_idx], stream_transfer));
             }
 
-            // Compute current batch (overlaps with next batch transfer)
+            // Compute current batch (overlaps với next batch transfer)
             // Tính loss mỗi 5 batches để có curve mượt hơn (~156 samples/epoch)
             bool compute_loss = (b % 5 == 0);
             
@@ -203,7 +202,6 @@ int main() {
                 // Use async loss: loss computed on stream_loss, overlaps with next batch
                 ae.train_step_async_loss(
                     d_batch_input_buf[buf_idx], d_batch_recon_buf[buf_idx],
-                    current_batch_size,
                     current_compute_stream,
                     d_loss_buf[buf_idx], h_loss_buf[buf_idx],
                     ev_compute_done[buf_idx], ev_loss_done[buf_idx],
@@ -214,7 +212,7 @@ int main() {
             } else {
                 // Normal train step without loss
                 ae.train_step(d_batch_input_buf[buf_idx], d_batch_recon_buf[buf_idx],
-                              current_batch_size, current_compute_stream, false, nullptr);
+                              current_compute_stream, false, nullptr);
                 // CRITICAL: Record compute completion event (cần cho race condition fix)
                 CUDA_CHECK(cudaEventRecord(ev_compute_done[buf_idx], current_compute_stream));
             }
@@ -301,3 +299,4 @@ int main() {
 
     return 0;
 }
+

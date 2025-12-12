@@ -33,23 +33,20 @@ public:
 
     // Forward: input (device pointer, shape N x 3 x H x W)
     // Output: recon (device pointer, shape N x 3 x H x W)
-    // actual_N (optional): số mẫu thực tế trong buffer. Nếu <=0 dùng N_ (đã khởi tạo).
-    void forward(const float* d_input, float* d_recon, int actual_N = -1);
+    void forward(const float* d_input, float* d_recon);
 
     // Feature extraction: chỉ chạy encoder, trả về latent (N x 128 x 8 x 8)
-    // Output: d_features (device pointer, shape actual_N x 128 x 8 x 8)
-    void extract_features(const float* d_input, float* d_features, int actual_N = -1);
+    // Output: d_features (device pointer, shape N x 128 x 8 x 8)
+    void extract_features(const float* d_input, float* d_features);
 
     // Backward toàn bộ AE với MSE loss:
     // - Trả về loss trên host (float)
-    // actual_N (optional): số mẫu thực tế — dùng để tính total elements / gradient scale
-    float train_step(const float* d_input, float* d_recon, int actual_N = -1);
+    float train_step(const float* d_input, float* d_recon);
 
     // Chạy backward (sau khi đã có d_recon từ MSE loss)
     void backward(const float* d_input,
                   const float* d_recon,
-                  const float* d_drecon,
-                  int actual_N = -1);
+                  const float* d_drecon);
 
     // SGD update: w -= lr * dw, b -= lr * db
     void step();
@@ -119,3 +116,5 @@ private:
 };
 
 #endif // AUTOENCODER_GPU_H
+
+

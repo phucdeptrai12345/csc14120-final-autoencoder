@@ -81,8 +81,8 @@ int main() {
                              batch_images.size() * sizeof(float),
                              cudaMemcpyHostToDevice));
         
-        // Extract features - pass actual_batch_size
-        ae.extract_features(d_batch_input, d_batch_features, actual_batch_size);
+        // Extract features
+        ae.extract_features(d_batch_input, d_batch_features);
         
         // Copy back to host
         CUDA_CHECK(cudaMemcpy(&train_features[start_idx * feature_dim],
@@ -123,8 +123,8 @@ int main() {
                              batch_images.size() * sizeof(float),
                              cudaMemcpyHostToDevice));
         
-        // Extract features - pass actual_batch_size
-        ae.extract_features(d_batch_input, d_batch_features, actual_batch_size);
+        // Extract features
+        ae.extract_features(d_batch_input, d_batch_features);
         
         // Copy back to host
         CUDA_CHECK(cudaMemcpy(&test_features[start_idx * feature_dim],
@@ -183,3 +183,4 @@ int main() {
 
     return 0;
 }
+

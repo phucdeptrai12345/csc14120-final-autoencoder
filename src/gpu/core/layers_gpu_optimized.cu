@@ -53,8 +53,7 @@ __global__ void im2col_kernel(
 
     // Write C*K*K values for this column
     int K2 = K * K;
-    int rows = C * K2;     // rows = C*K*K (column-major stride)
-    int col_base = idx;    // column index
+    int col_base = idx; // column index
     for (int c = 0; c < C; ++c) {
         for (int kh = 0; kh < K; ++kh) {
             for (int kw = 0; kw < K; ++kw) {
@@ -66,8 +65,8 @@ __global__ void im2col_kernel(
                     val = data_im[im_idx];
                 }
                 int k_idx = (c * K2) + kh * K + kw; // [0, C*K*K)
-                // data_col layout: (rows x cols) column-major -> row + col*rows
-                data_col[k_idx + col_base * rows] = val;
+                // data_col layout: (C*K*K) rows, (N*H*W) cols, column-major stride by rows
+                data_col[k_idx * total_cols + col_base] = val;
             }
         }
     }
@@ -166,7 +165,6 @@ __global__ void im2col_fp16_kernel(
     int pad = K / 2;
 
     int K2 = K * K;
-    int rows = C * K2; // column-major stride
     for (int c = 0; c < C; ++c) {
         for (int kh = 0; kh < K; ++kh) {
             for (int kw = 0; kw < K; ++kw) {
@@ -178,8 +176,7 @@ __global__ void im2col_fp16_kernel(
                     val = data_im[im_idx];
                 }
                 int k_idx = (c * K2) + kh * K + kw; // [0, C*K*K)
-                // data_col layout: column-major (rows x cols)
-                data_col[k_idx + idx * rows] = __float2half(val);
+                data_col[k_idx * total_cols + idx] = __float2half(val);
             }
         }
     }
@@ -248,7 +245,7 @@ __global__ void col2im_kernel_noatomic(
     int n = idx / (W * H * C);
 
     int HW = H * W;
-    int rows = C * K * K; // column-major stride
+    int cols = N * HW;
     int K2 = K * K;
     int pad = K / 2;
 
@@ -260,8 +257,7 @@ __global__ void col2im_kernel_noatomic(
             if (ih >= 0 && ih < H && iw >= 0 && iw < W) {
                 int col = n * HW + ih * W + iw;             // column index
                 int row = (c * K2) + kh * K + kw;           // row index
-                // data_col layout: column-major (rows x cols)
-                sum += data_col[row + col * rows];
+                sum += data_col[row * cols + col];
             }
         }
     }
