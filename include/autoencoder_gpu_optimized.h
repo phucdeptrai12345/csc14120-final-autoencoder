@@ -102,16 +102,16 @@ private:
     float *d_dw5_, *d_db5_;
 
     // Intermediate activations (device)
-    // Step 2: Keep d_conv buffers for backward correctness
+    // Note: d_conv1-4 buffers removed - fused kernels write directly to d_relu*
     // Encoder path:
-    float *d_conv1_, *d_relu1_;      // (N, 256, 32, 32)
+    float *d_relu1_;                 // (N, 256, 32, 32)
     float *d_pool1_;                 // (N, 256, 16, 16)
-    float *d_conv2_, *d_relu2_;      // (N, 128, 16, 16)
+    float *d_relu2_;                 // (N, 128, 16, 16)
     float *d_pool2_;                 // (N, 128, 8, 8) = LATENT
     // Decoder path:
-    float *d_conv3_, *d_relu3_;      // (N, 128, 8, 8)
+    float *d_relu3_;                 // (N, 128, 8, 8)
     float *d_up1_;                   // (N, 128, 16, 16)
-    float *d_conv4_, *d_relu4_;      // (N, 256, 16, 16)
+    float *d_relu4_;                 // (N, 256, 16, 16)
     float *d_up2_;                   // (N, 256, 32, 32)
     float *d_conv5_;                 // (N, 3, 32, 32) = OUTPUT
 

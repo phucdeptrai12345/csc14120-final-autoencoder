@@ -1,7 +1,4 @@
-// ============================================
-// autoencoder_gpu_optimized.cu - PHASE 3 FINAL
-// Complete implementation with all optimizations
-// ============================================
+// autoencoder_gpu_optimized.cu - Optimized GPU autoencoder implementation
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>  // For FP16 support (must be before layers_gpu_optimized.h)
 #include <cublas_v2.h>
@@ -15,13 +12,6 @@
 #include "layers_gpu_optimized.h"
 #include "layers_gpu.h"
 
-// Forward declarations for optimized kernels (defined in layers_gpu_optimized.cu)
-extern void maxpool2d_forward_gpu_optimized(
-    const float* d_input, float* d_output,
-    int N, int C, int H, int W, cudaStream_t stream);
-extern void upsample2d_forward_gpu_optimized(
-    const float* d_input, float* d_output,
-    int N, int C, int H, int W, cudaStream_t stream);
 
 #define CUDA_CHECK(cmd) \
     do { \
@@ -54,10 +44,10 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
       d_dw3_(nullptr), d_db3_(nullptr),
       d_dw4_(nullptr), d_db4_(nullptr),
       d_dw5_(nullptr), d_db5_(nullptr),
-      d_conv1_(nullptr), d_relu1_(nullptr), d_pool1_(nullptr),
-      d_conv2_(nullptr), d_relu2_(nullptr), d_pool2_(nullptr),
-      d_conv3_(nullptr), d_relu3_(nullptr), d_up1_(nullptr),
-      d_conv4_(nullptr), d_relu4_(nullptr), d_up2_(nullptr),
+      d_relu1_(nullptr), d_pool1_(nullptr),
+      d_relu2_(nullptr), d_pool2_(nullptr),
+      d_relu3_(nullptr), d_up1_(nullptr),
+      d_relu4_(nullptr), d_up2_(nullptr),
       d_conv5_(nullptr),
       d_dconv1_(nullptr), d_drelu1_(nullptr), d_dpool1_(nullptr),
       d_dconv2_(nullptr), d_drelu2_(nullptr), d_dpool2_(nullptr),
@@ -103,17 +93,13 @@ AutoencoderGPUOptimized::AutoencoderGPUOptimized(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMalloc(&d_db5_, C5_ * sizeof(float)));
 
     // === ALLOCATE ACTIVATIONS ===
-    CUDA_CHECK(cudaMalloc(&d_conv1_, N_ * C1_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu1_, N_ * C1_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_pool1_, N_ * C1_ * H16 * W16 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_conv2_, N_ * C2_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu2_, N_ * C2_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_pool2_, N_ * C2_ * H8 * W8 * sizeof(float)));
 
-    CUDA_CHECK(cudaMalloc(&d_conv3_, N_ * C3_ * H8 * W8 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu3_, N_ * C3_ * H8 * W8 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_up1_, N_ * C3_ * H16 * W16 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_conv4_, N_ * C4_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu4_, N_ * C4_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_up2_, N_ * C4_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_conv5_, N_ * C5_ * H_ * W_ * sizeof(float)));
@@ -220,10 +206,10 @@ AutoencoderGPUOptimized::~AutoencoderGPUOptimized() {
     cudaFree(d_dw3_); cudaFree(d_db3_);
     cudaFree(d_dw4_); cudaFree(d_db4_);
     cudaFree(d_dw5_); cudaFree(d_db5_);
-    cudaFree(d_conv1_); cudaFree(d_relu1_); cudaFree(d_pool1_);
-    cudaFree(d_conv2_); cudaFree(d_relu2_); cudaFree(d_pool2_);
-    cudaFree(d_conv3_); cudaFree(d_relu3_); cudaFree(d_up1_);
-    cudaFree(d_conv4_); cudaFree(d_relu4_); cudaFree(d_up2_);
+    cudaFree(d_relu1_); cudaFree(d_pool1_);
+    cudaFree(d_relu2_); cudaFree(d_pool2_);
+    cudaFree(d_relu3_); cudaFree(d_up1_);
+    cudaFree(d_relu4_); cudaFree(d_up2_);
     cudaFree(d_conv5_);
     cudaFree(d_dconv1_); cudaFree(d_drelu1_); cudaFree(d_dpool1_);
     cudaFree(d_dconv2_); cudaFree(d_drelu2_); cudaFree(d_dpool2_);
@@ -239,9 +225,7 @@ AutoencoderGPUOptimized::~AutoencoderGPUOptimized() {
     if (cublas_handle_) cublasDestroy(cublas_handle_);
 }
 
-// ============================================
-// GPU FP16 SUPPORT CHECK
-// ============================================
+// GPU FP16 support check
 bool AutoencoderGPUOptimized::check_fp16_support() {
     int device = 0;
     cudaDeviceProp prop;
@@ -265,32 +249,21 @@ bool AutoencoderGPUOptimized::check_fp16_support() {
     return supports;
 }
 
-// ============================================
-// OPTIMIZED FORWARD PASS (Fused kernels + heuristic)
-// ============================================
 void AutoencoderGPUOptimized::forward(const float* d_input, float* d_recon, cudaStream_t stream) {
     int H16 = H_ / 2;
     int W16 = W_ / 2;
     int H8 = H_ / 4;
     int W8 = W_ / 4;
     
-    // FIX: Optimized kernel selection based on analysis
-    // Conv1: FP32 fused (rows=27 too small for GEMM, im2col overhead > benefit)
-    // Conv2: FP16/FP32 GEMM (rows=2304 large enough, GEMM efficient)
-    // Conv3: FP32 fused (rows=1152 borderline, but fused slightly better for this size)
-    // Conv4: FP16/FP32 GEMM (rows=1152 but cols=16384, GEMM wins)
-    // Conv5: FP32 naive (output layer, 3 channels)
     bool use_fp16 = (use_mixed_precision_ && gpu_supports_fp16_);
     
     // ENCODER
-    // Conv1: FP32 fused (C_in=3, rows=27 → fused faster than GEMM)
     conv2d_relu_forward_gpu_fused(
         d_input, d_w1_, d_b1_, d_relu1_,
         N_, C_in_, H_, W_, C1_, K_, stream);
     
     maxpool2d_forward_gpu_optimized(d_relu1_, d_pool1_, N_, C1_, H_, W_, stream);
     
-    // Conv2: FP16/FP32 GEMM (rows=2304 large, GEMM efficient)
     if (use_fp16) {
         conv2d_relu_forward_gemm_fp16(
             d_pool1_, d_w2_, d_b2_, d_relu2_,
@@ -306,7 +279,6 @@ void AutoencoderGPUOptimized::forward(const float* d_input, float* d_recon, cuda
     maxpool2d_forward_gpu_optimized(d_relu2_, d_pool2_, N_, C2_, H16, W16, stream);
     
     // DECODER
-    // Conv3: thử GEMM (FP16 nếu có, FP32 nếu không) để benchmark
     if (use_fp16) {
         conv2d_relu_forward_gemm_fp16(
             d_pool2_, d_w3_, d_b3_, d_relu3_,
@@ -321,7 +293,6 @@ void AutoencoderGPUOptimized::forward(const float* d_input, float* d_recon, cuda
     
     upsample2d_forward_gpu_optimized(d_relu3_, d_up1_, N_, C3_, H8, W8, stream);
     
-    // Conv4: FP16/FP32 GEMM (rows=1152 but cols=16384, GEMM wins)
     if (use_fp16) {
         conv2d_relu_forward_gemm_fp16(
             d_up1_, d_w4_, d_b4_, d_relu4_,
@@ -336,35 +307,26 @@ void AutoencoderGPUOptimized::forward(const float* d_input, float* d_recon, cuda
     
     upsample2d_forward_gpu_optimized(d_relu4_, d_up2_, N_, C4_, H16, W16, stream);
     
-    // Conv5: giữ naive (3 output channels)
     conv2d_forward_gpu_naive(
         d_up2_, d_w5_, d_b5_, d_recon,
         N_, C4_, H_, W_, C5_, K_, stream);
 }
 
-// ============================================
-// FEATURE EXTRACTION (Encoder only) - FULLY OPTIMIZED
-// ============================================
+// Feature extraction (encoder only)
 void AutoencoderGPUOptimized::extract_features(const float* d_input, float* d_features, cudaStream_t stream) {
     int H16 = H_ / 2;
     int W16 = W_ / 2;
     int H8 = H_ / 4;
     int W8 = W_ / 4;
     
-    // OPTIMIZATION: Optimized kernel selection (hard-coded cho performance tốt nhất)
-    // Conv1: FP32 fused (C_in=3 nhỏ → fused tốt hơn GEMM)
-    // Conv2: FP16 GEMM nếu GPU supports, ngược lại FP32 GEMM
-    // Conv3: thử GEMM (FP16 nếu có, FP32 nếu không) để benchmark
     bool use_fp16 = (use_mixed_precision_ && gpu_supports_fp16_);
     
-    // Conv1: FP32 fused
     conv2d_relu_forward_gpu_fused(
         d_input, d_w1_, d_b1_, d_relu1_,
         N_, C_in_, H_, W_, C1_, K_, stream);
     
     maxpool2d_forward_gpu_optimized(d_relu1_, d_pool1_, N_, C1_, H_, W_, stream);
     
-    // Conv2: FP16 GEMM nếu GPU supports
     if (use_fp16) {
         conv2d_relu_forward_gemm_fp16(
             d_pool1_, d_w2_, d_b2_, d_relu2_,
@@ -377,7 +339,6 @@ void AutoencoderGPUOptimized::extract_features(const float* d_input, float* d_fe
             d_im2col_, d_gemm_out_, cublas_handle_, stream);
     }
     
-    // OPTIMIZATION 4: Use optimized pooling kernel
     maxpool2d_forward_gpu_optimized(d_relu2_, d_pool2_, N_, C2_, H16, W16, stream);
     
     // Copy latent representation to output
@@ -386,9 +347,6 @@ void AutoencoderGPUOptimized::extract_features(const float* d_input, float* d_fe
                                cudaMemcpyDeviceToDevice, stream));
 }
 
-// ============================================
-// TRAINING STEP (Forward + Backward + Update)
-// ============================================
 float AutoencoderGPUOptimized::train_step(const float* d_input, float* d_recon,
                                           cudaStream_t stream,
                                           bool compute_loss_host,
@@ -406,7 +364,6 @@ float AutoencoderGPUOptimized::train_step(const float* d_input, float* d_recon,
     return loss_host;
 }
 
-// Async loss version: loss computed on separate stream
 void AutoencoderGPUOptimized::train_step_async_loss(const float* d_input, float* d_recon,
                                                     cudaStream_t stream_compute,
                                                     float* d_loss_buf,
@@ -436,11 +393,7 @@ void AutoencoderGPUOptimized::train_step_async_loss(const float* d_input, float*
     CUDA_CHECK(cudaEventRecord(ev_loss_done, stream_loss));
 }
 
-// ============================================
-// OPTIMIZED KERNELS: Batch Operations
-// ============================================
-
-// Kernel để zero tất cả gradients cùng lúc (thay vì 10 memset calls)
+// Batched operations: zero gradients and SGD update
 __global__ void zero_gradients_batched_kernel(
     float* d_dw1, int n_w1,
     float* d_db1, int n_b1,
@@ -481,7 +434,6 @@ __global__ void zero_gradients_batched_kernel(
     if (idx < offset + n_b5) { d_db5[idx - offset] = 0.0f; }
 }
 
-// Batched SGD update kernel (thay vì 10 kernel launches riêng biệt)
 __global__ void sgd_update_batched_kernel(
     float* d_w1, const float* d_dw1, int n_w1,
     float* d_b1, const float* d_db1, int n_b1,
@@ -523,9 +475,7 @@ __global__ void sgd_update_batched_kernel(
     if (idx < offset + n_b5) { d_b5[idx - offset] -= lr * d_db5[idx - offset]; }
 }
 
-// ============================================
-// BACKWARD PASS (All gradients)
-// ============================================
+// Backward pass
 void AutoencoderGPUOptimized::backward(const float* d_input,
                               const float* d_recon,
                                        const float* d_drecon,
@@ -535,7 +485,6 @@ void AutoencoderGPUOptimized::backward(const float* d_input,
     int H8 = H_ / 4;
     int W8 = W_ / 4;
     
-    // OPTIMIZATION: Zero tất cả gradients trong một kernel launch thay vì 10 memset calls
     int n_w1 = C1_ * C_in_ * K_ * K_;
     int n_w2 = C2_ * C1_ * K_ * K_;
     int n_w3 = C3_ * C2_ * K_ * K_;
@@ -586,14 +535,12 @@ void AutoencoderGPUOptimized::backward(const float* d_input,
         d_im2col_, cublas_handle_, stream);
     maxpool2d_backward_gpu(d_dpool1_, d_relu1_, d_drelu1_, N_, C1_, H_, W_, stream);
     relu_backward_gpu(d_drelu1_, d_relu1_, d_dconv1_, N_ * C1_ * H_ * W_, stream);
-    // FIX: Conv1 backward dùng optimized kernel (matrix nhỏ, GEMM overhead > benefit)
     conv2d_backward_gpu_optimized(
         d_dconv1_, d_input, d_w1_,
         d_dinput_temp_, d_dw1_, d_db1_,
         N_, C_in_, H_, W_, C1_, K_, stream);
 }
 
-// Legacy SGD kernel (giữ lại cho compatibility)
 __global__ void sgd_update_kernel(float* param, const float* grad, float lr, int N) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= N) return;
@@ -601,7 +548,6 @@ __global__ void sgd_update_kernel(float* param, const float* grad, float lr, int
 }
 
 void AutoencoderGPUOptimized::step(cudaStream_t stream) {
-    // OPTIMIZATION: Batched SGD update trong một kernel launch thay vì 10 launches riêng biệt
     int n_w1 = C1_ * C_in_ * K_ * K_;
     int n_w2 = C2_ * C1_ * K_ * K_;
     int n_w3 = C3_ * C2_ * K_ * K_;
@@ -627,9 +573,7 @@ void AutoencoderGPUOptimized::step(cudaStream_t stream) {
     CUDA_CHECK(cudaGetLastError());
 }
 
-// ============================================
-// SAVE/LOAD WEIGHTS
-// ============================================
+// Save/Load weights
 void AutoencoderGPUOptimized::save_weights(const std::string& filepath) const {
     std::ofstream file(filepath, std::ios::binary);
     if (!file.is_open()) {
@@ -637,7 +581,6 @@ void AutoencoderGPUOptimized::save_weights(const std::string& filepath) const {
         return;
     }
     
-    // FIX: Add header to match Phase 2 format for compatibility
     int num_layers = 5;
     file.write(reinterpret_cast<const char*>(&num_layers), sizeof(int));
     
@@ -690,7 +633,6 @@ void AutoencoderGPUOptimized::load_weights(const std::string& filepath) {
         return;
     }
     
-    // FIX: Read header to match Phase 2 format (backward compatible)
     int num_layers;
     file.read(reinterpret_cast<char*>(&num_layers), sizeof(int));
     if (num_layers != 5) {
