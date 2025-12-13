@@ -44,6 +44,16 @@ public:
                      cudaStream_t stream = 0,
                      bool compute_loss_host = false,
                      float* h_loss_out = nullptr);
+    
+    // Async loss version: returns immediately, loss computed on stream_loss
+    // If async params are nullptr, falls back to sync mode
+    void train_step_async_loss(const float* d_input, float* d_recon,
+                               cudaStream_t stream_compute,
+                               float* d_loss_buf,      // Pre-allocated device loss buffer
+                               float* h_loss_buf,      // Host buffer for loss result
+                               cudaEvent_t ev_compute_done,  // Event to record after step()
+                               cudaEvent_t ev_loss_done,     // Event to record after loss copy
+                               cudaStream_t stream_loss);
 
     // Backward pass (uses naive kernels for now)
     void backward(const float* d_input,
@@ -83,6 +93,10 @@ private:
     float *d_w3_, *d_b3_;
     float *d_w4_, *d_b4_;
     float *d_w5_, *d_b5_;
+    
+    // Constant memory for biases (faster broadcast access)
+    // Note: Constant memory limited to 64KB total, but we only store biases (small)
+    // C1=256, C2=128, C3=128, C4=256, C5=3 = 771 floats = 3KB (well within limit)
 
     // Gradients (device)
     float *d_dw1_, *d_db1_;
@@ -92,16 +106,16 @@ private:
     float *d_dw5_, *d_db5_;
 
     // Intermediate activations (device)
-    // Step 2: Keep d_conv buffers for backward correctness
+    // Note: d_conv1-4 buffers removed - fused kernels write directly to d_relu*
     // Encoder path:
-    float *d_conv1_, *d_relu1_;      // (N, 256, 32, 32)
+    float *d_relu1_;                 // (N, 256, 32, 32)
     float *d_pool1_;                 // (N, 256, 16, 16)
-    float *d_conv2_, *d_relu2_;      // (N, 128, 16, 16)
+    float *d_relu2_;                 // (N, 128, 16, 16)
     float *d_pool2_;                 // (N, 128, 8, 8) = LATENT
     // Decoder path:
-    float *d_conv3_, *d_relu3_;      // (N, 128, 8, 8)
+    float *d_relu3_;                 // (N, 128, 8, 8)
     float *d_up1_;                   // (N, 128, 16, 16)
-    float *d_conv4_, *d_relu4_;      // (N, 256, 16, 16)
+    float *d_relu4_;                 // (N, 256, 16, 16)
     float *d_up2_;                   // (N, 256, 32, 32)
     float *d_conv5_;                 // (N, 3, 32, 32) = OUTPUT
 
@@ -116,18 +130,27 @@ private:
     // Temporary buffer for Conv1 backward input gradient (tránh race condition)
     float *d_dinput_temp_;
     
-    // Mixed Precision (FP16) buffers - reused across forward passes
+    // GEMM (im2col + cuBLAS) workspaces
+    float *d_im2col_;   // workspace for im2col
+    float *d_gemm_out_; // workspace for GEMM output (column-major)
+    __half *d_im2col_fp16_; // workspace FP16 im2col for GEMM FP16
+    cublasHandle_t cublas_handle_;
+    
+    // Mixed Precision (FP16) - chỉ dùng cho Conv2-4 với GEMM
     bool use_mixed_precision_;
     bool gpu_supports_fp16_;
-    // FP16 buffers for activations (reused to avoid allocation overhead)
-    // Need separate input/output buffers to avoid race conditions
-    __half *d_fp16_input1_, *d_fp16_output1_;  // For Conv1 (input: N*3*32*32, output: N*256*32*32)
-    __half *d_fp16_input2_, *d_fp16_output2_;  // For Conv2 (input: N*256*16*16, output: N*128*16*16)
-    __half *d_fp16_input3_, *d_fp16_output3_;  // For Conv3 (input: N*128*8*8, output: N*128*8*8)
-    __half *d_fp16_input4_, *d_fp16_output4_;  // For Conv4 (input: N*128*16*16, output: N*256*16*16)
+    
+    // Constant memory strategy: separate training/inference paths
+    // Training: use global memory (bias changes every step) - no constant memory update
+    // Inference: use constant memory (bias static) - update once
+    bool is_training_mode_;
+    bool constant_memory_updated_;  // Track if constant memory is up-to-date for inference
     
     // Helper: Check GPU FP16 support
     bool check_fp16_support();
+    
+    // Set training/inference mode
+    void set_training_mode(bool is_training) { is_training_mode_ = is_training; }
 };
 
 #endif // AUTOENCODER_GPU_OPTIMIZED_H

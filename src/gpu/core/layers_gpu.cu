@@ -112,11 +112,14 @@ __global__ void conv2d_backward_input_kernel(
     float sum = 0.0f;
 
     // sum over tất cả output channel & kernel positions
+    // Convolution backward input: flip kernel 180° (rotation)
     for (int co = 0; co < C_out; ++co) {
+        #pragma unroll
         for (int kh = 0; kh < K; ++kh) {
+            #pragma unroll
             for (int kw = 0; kw < K; ++kw) {
-                int h_out = h - kh + pad;
-                int w_out = w - kw + pad;
+                int h_out = h + kh - pad;  // Flip kernel: +kh instead of -kh
+                int w_out = w + kw - pad;  // Flip kernel: +kw instead of -kw
 
                 if (h_out < 0 || h_out >= H || w_out < 0 || w_out >= W)
                     continue;
@@ -339,7 +342,9 @@ __global__ void maxpool2d_forward_kernel(
 
     float m = -1e30f;
 
+    #pragma unroll
     for (int dh = 0; dh < 2; ++dh) {
+        #pragma unroll
         for (int dw = 0; dw < 2; ++dw) {
             int ih = h_in + dh;
             int iw = w_in + dw;
@@ -411,7 +416,9 @@ __global__ void maxpool2d_backward_kernel(
     int max_h = h_in;
     int max_w = w_in;
 
+    #pragma unroll
     for (int dh = 0; dh < 2; ++dh) {
+        #pragma unroll
         for (int dw = 0; dw < 2; ++dw) {
             int ih = h_in + dh;
             int iw = w_in + dw;
@@ -571,6 +578,58 @@ void upsample2d_backward_gpu(
 // MSE LOSS FORWARD
 // ======================
 
+// Warp-level reduction helper (faster than shared memory)
+__device__ __forceinline__ float warp_reduce_sum(float val) {
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        val += __shfl_down_sync(0xffffffff, val, offset);
+    }
+    return val;
+}
+
+// Optimized warp-level reduction kernel
+__global__ void mse_loss_forward_warp_kernel(
+    const float* __restrict__ pred,
+    const float* __restrict__ target,
+    float* loss_accum,
+    int N)
+{
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int lane_id = threadIdx.x % 32;
+    int warp_id = threadIdx.x / 32;
+    int step = blockDim.x * gridDim.x;
+
+    // Each thread computes local sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < N; i += step) {
+        float diff = pred[i] - target[i];
+        local_sum += diff * diff;
+    }
+
+    // Warp-level reduction (no shared memory needed for this step)
+    local_sum = warp_reduce_sum(local_sum);
+
+    // First thread in each warp writes to shared memory
+    // Max 8 warps per block (256 threads / 32 = 8 warps)
+    // Allocate 32 floats để safe cho block size lớn hơn
+    __shared__ float warp_sums[32];
+    if (lane_id == 0) {
+        warp_sums[warp_id] = local_sum;
+    }
+    __syncthreads();
+
+    // Final reduction by first warp
+    if (warp_id == 0) {
+        float val = (lane_id < (blockDim.x + 31) / 32) ? warp_sums[lane_id] : 0.0f;
+        val = warp_reduce_sum(val);
+
+        if (lane_id == 0) {
+            atomicAdd(loss_accum, val);
+        }
+    }
+}
+
+// Original shared memory kernel (kept for fallback/comparison)
 __global__ void mse_loss_forward_kernel(
     const float* pred,
     const float* target,
@@ -621,9 +680,11 @@ float mse_loss_forward_gpu(
     int grid  = (total_elements + block - 1) / block;
     if (grid > 1024) grid = 1024;
 
-    size_t shared_size = block * sizeof(float);
-
-    mse_loss_forward_kernel<<<grid, block, shared_size, stream>>>(
+    // Use warp-level reduction kernel (faster, less shared memory)
+    // Max 8 warps per block (256 threads / 32 = 8 warps)
+    // Allocate 32 floats để safe cho block size lớn hơn
+    size_t shared_size = 32 * sizeof(float);
+    mse_loss_forward_warp_kernel<<<grid, block, shared_size, stream>>>(
         d_pred, d_target, d_loss, total_elements);
 
     CUDA_CHECK(cudaGetLastError());
@@ -633,6 +694,34 @@ float mse_loss_forward_gpu(
 
     h_loss /= static_cast<float>(total_elements);
     return h_loss;
+}
+
+// Async version: uses pre-allocated buffers, returns immediately
+// Caller must sync stream_loss and divide by total_elements
+void mse_loss_forward_gpu_async(
+    const float* d_pred,
+    const float* d_target,
+    int total_elements,
+    float* d_loss_buf,  // Pre-allocated device buffer (must be zeroed)
+    float* h_loss_buf,  // Host buffer to receive result
+    cudaStream_t stream_loss)
+{
+    int block = 256;
+    int grid  = (total_elements + block - 1) / block;
+    if (grid > 1024) grid = 1024;
+
+    // Use warp-level reduction kernel (faster, less shared memory)
+    // Max 8 warps per block (256 threads / 32 = 8 warps)
+    // Allocate 32 floats để safe cho block size lớn hơn
+    size_t shared_size = 32 * sizeof(float);
+    mse_loss_forward_warp_kernel<<<grid, block, shared_size, stream_loss>>>(
+        d_pred, d_target, d_loss_buf, total_elements);
+
+    CUDA_CHECK(cudaGetLastError());
+
+    // Async copy to host
+    CUDA_CHECK(cudaMemcpyAsync(h_loss_buf, d_loss_buf, sizeof(float),
+                               cudaMemcpyDeviceToHost, stream_loss));
 }
 
 // ======================

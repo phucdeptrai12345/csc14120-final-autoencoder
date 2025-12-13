@@ -44,32 +44,23 @@ AutoencoderGPU::AutoencoderGPU(int N, int H, int W, float lr)
       d_dconv3_(nullptr), d_drelu3_(nullptr), d_dup1_(nullptr),
       d_dconv4_(nullptr), d_drelu4_(nullptr), d_dup2_(nullptr),
       d_dconv5_(nullptr),
+      d_dinput1_(nullptr),
       d_drecon_(nullptr) {
 
-    // Tính kích thước các layer
-    int H16 = H_ / 2;  // sau pool1
+    int H16 = H_ / 2;
     int W16 = W_ / 2;
-    int H8 = H_ / 4;   // sau pool2 (latent)
+    int H8 = H_ / 4;
     int W8 = W_ / 4;
-
-    // Allocate weights & biases (5 conv layers)
-    // Conv1: 3→256
     CUDA_CHECK(cudaMalloc(&d_w1_, C1_ * C_in_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_b1_, C1_ * sizeof(float)));
-    // Conv2: 256→128
     CUDA_CHECK(cudaMalloc(&d_w2_, C2_ * C1_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_b2_, C2_ * sizeof(float)));
-    // Conv3: 128→128
     CUDA_CHECK(cudaMalloc(&d_w3_, C3_ * C2_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_b3_, C3_ * sizeof(float)));
-    // Conv4: 128→256
     CUDA_CHECK(cudaMalloc(&d_w4_, C4_ * C3_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_b4_, C4_ * sizeof(float)));
-    // Conv5: 256→3
     CUDA_CHECK(cudaMalloc(&d_w5_, C5_ * C4_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_b5_, C5_ * sizeof(float)));
-
-    // Allocate gradients
     CUDA_CHECK(cudaMalloc(&d_dw1_, C1_ * C_in_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_db1_, C1_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dw2_, C2_ * C1_ * K_ * K_ * sizeof(float)));
@@ -81,22 +72,19 @@ AutoencoderGPU::AutoencoderGPU(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMalloc(&d_dw5_, C5_ * C4_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_db5_, C5_ * sizeof(float)));
 
-    // Allocate activations
-    // Encoder
     CUDA_CHECK(cudaMalloc(&d_conv1_, N_ * C1_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu1_, N_ * C1_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_pool1_, N_ * C1_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_conv2_, N_ * C2_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu2_, N_ * C2_ * H16 * W16 * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_pool2_, N_ * C2_ * H8 * W8 * sizeof(float))); // LATENT
-    // Decoder
+    CUDA_CHECK(cudaMalloc(&d_pool2_, N_ * C2_ * H8 * W8 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_conv3_, N_ * C3_ * H8 * W8 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu3_, N_ * C3_ * H8 * W8 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_up1_, N_ * C3_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_conv4_, N_ * C4_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_relu4_, N_ * C4_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_up2_, N_ * C4_ * H_ * W_ * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_conv5_, N_ * C5_ * H_ * W_ * sizeof(float))); // OUTPUT
+    CUDA_CHECK(cudaMalloc(&d_conv5_, N_ * C5_ * H_ * W_ * sizeof(float)));
 
     // Allocate activation gradients
     CUDA_CHECK(cudaMalloc(&d_dconv1_, N_ * C1_ * H_ * W_ * sizeof(float)));
@@ -112,6 +100,8 @@ AutoencoderGPU::AutoencoderGPU(int N, int H, int W, float lr)
     CUDA_CHECK(cudaMalloc(&d_drelu4_, N_ * C4_ * H16 * W16 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dup2_, N_ * C4_ * H_ * W_ * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_dconv5_, N_ * C5_ * H_ * W_ * sizeof(float)));
+    // Buffer riêng cho dL/dInput của Conv1
+    CUDA_CHECK(cudaMalloc(&d_dinput1_, N_ * C_in_ * H_ * W_ * sizeof(float)));
 
     // Allocate reusable buffer for dL/d(recon) to avoid per-iteration malloc/free
     int total_output = N_ * C5_ * H_ * W_;
@@ -192,6 +182,7 @@ AutoencoderGPU::~AutoencoderGPU() {
     CUDA_CHECK(cudaFree(d_dconv3_)); CUDA_CHECK(cudaFree(d_drelu3_)); CUDA_CHECK(cudaFree(d_dup1_));
     CUDA_CHECK(cudaFree(d_dconv4_)); CUDA_CHECK(cudaFree(d_drelu4_)); CUDA_CHECK(cudaFree(d_dup2_));
     CUDA_CHECK(cudaFree(d_dconv5_));
+    CUDA_CHECK(cudaFree(d_dinput1_));
     CUDA_CHECK(cudaFree(d_drecon_));
 }
 
@@ -201,45 +192,39 @@ void AutoencoderGPU::forward(const float* d_input, float* d_recon) {
     int H8 = H_ / 4;
     int W8 = W_ / 4;
 
-    // ENCODER
-    // Conv1: 3→256, ReLU
+    // Conv1
     conv2d_forward_gpu_naive(
         d_input, d_w1_, d_b1_, d_conv1_,
         N_, C_in_, H_, W_, C1_, K_);
     relu_forward_gpu(d_conv1_, d_relu1_, N_ * C1_ * H_ * W_);
 
-    // MaxPool1: (32,32) → (16,16)
     maxpool2d_forward_gpu(d_relu1_, d_pool1_, N_, C1_, H_, W_);
 
-    // Conv2: 256→128, ReLU
+    // Conv2
     conv2d_forward_gpu_naive(
         d_pool1_, d_w2_, d_b2_, d_conv2_,
         N_, C1_, H16, W16, C2_, K_);
     relu_forward_gpu(d_conv2_, d_relu2_, N_ * C2_ * H16 * W16);
 
-    // MaxPool2: (16,16) → (8,8) = LATENT
     maxpool2d_forward_gpu(d_relu2_, d_pool2_, N_, C2_, H16, W16);
 
-    // DECODER
-    // Conv3: 128→128, ReLU
+    // Conv3
     conv2d_forward_gpu_naive(
         d_pool2_, d_w3_, d_b3_, d_conv3_,
         N_, C2_, H8, W8, C3_, K_);
     relu_forward_gpu(d_conv3_, d_relu3_, N_ * C3_ * H8 * W8);
 
-    // Upsample1: (8,8) → (16,16)
     upsample2d_forward_gpu(d_relu3_, d_up1_, N_, C3_, H8, W8);
 
-    // Conv4: 128→256, ReLU
+    // Conv4
     conv2d_forward_gpu_naive(
         d_up1_, d_w4_, d_b4_, d_conv4_,
         N_, C3_, H16, W16, C4_, K_);
     relu_forward_gpu(d_conv4_, d_relu4_, N_ * C4_ * H16 * W16);
 
-    // Upsample2: (16,16) → (32,32)
     upsample2d_forward_gpu(d_relu4_, d_up2_, N_, C4_, H16, W16);
 
-    // Conv5: 256→3 (no activation)
+    // Conv5
     conv2d_forward_gpu_naive(
         d_up2_, d_w5_, d_b5_, d_recon,
         N_, C4_, H_, W_, C5_, K_);
@@ -251,8 +236,7 @@ void AutoencoderGPU::extract_features(const float* d_input, float* d_features) {
     int H8 = H_ / 4;
     int W8 = W_ / 4;
 
-    // Chỉ chạy encoder
-    // Conv1: 3→256, ReLU
+    // Conv1
     conv2d_forward_gpu_naive(
         d_input, d_w1_, d_b1_, d_conv1_,
         N_, C_in_, H_, W_, C1_, K_);
@@ -316,64 +300,43 @@ void AutoencoderGPU::backward(const float* d_input,
     CUDA_CHECK(cudaMemset(d_dw5_, 0, C5_ * C4_ * K_ * K_ * sizeof(float)));
     CUDA_CHECK(cudaMemset(d_db5_, 0, C5_ * sizeof(float)));
 
-    // DECODER BACKWARD
-    // 1) Conv5 backward: d_drecon -> d_dup2_
     conv2d_backward_gpu_naive(
         d_drecon, d_up2_, d_w5_,
         d_dup2_, d_dw5_, d_db5_,
         N_, C4_, H_, W_, C5_, K_);
 
-    // 2) Upsample2 backward: d_dup2_ -> d_drelu4_
     upsample2d_backward_gpu(d_dup2_, d_drelu4_, N_, C4_, H16, W16);
-
-    // 3) ReLU4 backward: d_drelu4_ -> d_dconv4_ (đúng thứ tự!)
     relu_backward_gpu(d_drelu4_, d_relu4_, d_dconv4_, N_ * C4_ * H16 * W16);
 
-    // 4) Conv4 backward: d_dconv4_ -> d_dup1_
     conv2d_backward_gpu_naive(
         d_dconv4_, d_up1_, d_w4_,
         d_dup1_, d_dw4_, d_db4_,
         N_, C3_, H16, W16, C4_, K_);
 
-    // 5) Upsample1 backward: d_dup1_ -> d_drelu3_
     upsample2d_backward_gpu(d_dup1_, d_drelu3_, N_, C3_, H8, W8);
-
-    // 6) ReLU3 backward: d_drelu3_ -> d_dconv3_ (đúng thứ tự!)
     relu_backward_gpu(d_drelu3_, d_relu3_, d_dconv3_, N_ * C3_ * H8 * W8);
 
-    // 7) Conv3 backward: d_dconv3_ -> d_dpool2_
     conv2d_backward_gpu_naive(
         d_dconv3_, d_pool2_, d_w3_,
         d_dpool2_, d_dw3_, d_db3_,
         N_, C2_, H8, W8, C3_, K_);
 
-    // ENCODER BACKWARD
-    // 8) MaxPool2 backward: d_dpool2_ -> d_drelu2_
     maxpool2d_backward_gpu(d_dpool2_, d_relu2_, d_drelu2_, N_, C2_, H16, W16);
-
-    // 9) ReLU2 backward: d_drelu2_ -> d_dconv2_ (đúng thứ tự!)
     relu_backward_gpu(d_drelu2_, d_relu2_, d_dconv2_, N_ * C2_ * H16 * W16);
 
-    // 10) Conv2 backward: d_dconv2_ -> d_dpool1_
     conv2d_backward_gpu_naive(
         d_dconv2_, d_pool1_, d_w2_,
         d_dpool1_, d_dw2_, d_db2_,
         N_, C1_, H16, W16, C2_, K_);
 
-    // 11) MaxPool1 backward: d_dpool1_ -> d_drelu1_
     maxpool2d_backward_gpu(d_dpool1_, d_relu1_, d_drelu1_, N_, C1_, H_, W_);
-
-    // 12) ReLU1 backward: d_drelu1_ -> d_dconv1_ (đúng thứ tự!)
     relu_backward_gpu(d_drelu1_, d_relu1_, d_dconv1_, N_ * C1_ * H_ * W_);
-
-    // 13) Conv1 backward: d_dconv1_ -> d_dinput (không cần output nhưng cần buffer hợp lệ)
     conv2d_backward_gpu_naive(
         d_dconv1_, d_input, d_w1_,
-        d_dconv1_, d_dw1_, d_db1_,  // d_dinput dùng lại buffer d_dconv1_ (không cần output)
+        d_dinput1_, d_dw1_, d_db1_,
         N_, C_in_, H_, W_, C1_, K_);
 }
 
-// Kernel SGD update: param -= lr * grad
 __global__ void sgd_update_kernel(float* param,
                                   const float* grad,
                                   float lr,
