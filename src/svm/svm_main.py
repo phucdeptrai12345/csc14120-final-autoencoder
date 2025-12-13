@@ -7,11 +7,6 @@ import time
 import os
 
 def load_binary_features(filepath):
-    """
-    Đọc định dạng binary custom từ C++:
-    Header: num_samples (int), feature_dim (int)
-    Body: features (float array), labels (int array)
-    """
     if not os.path.exists(filepath):
         print(f"Error: File {filepath} not found!")
         return None, None
@@ -46,9 +41,6 @@ def main():
     print("\nStarting SVM Training (Linear Kernel)...")
     start_time = time.time()
 
-    # Sử dụng LinearSVC (bọc LIBLINEAR) - Nhanh hơn SVC(kernel='linear') (bọc LIBSVM) 
-    # cho dữ liệu lớn và nhiều chiều.
-    # C=1.0 là tham số mặc định, bạn có thể chỉnh C=0.01 hoặc C=10 để test.
     clf = LinearSVC(C=1.0, dual=False, max_iter=1000)
     
     clf.fit(X_train, y_train)
